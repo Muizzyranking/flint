@@ -1,0 +1,20 @@
+[project]
+name = "flint"
+version = "0.1.0"
+description = "Quietly igniting your payload, every job has a spark"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.136.3",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = [ "E", "F", "I", "B", "UP" ]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
