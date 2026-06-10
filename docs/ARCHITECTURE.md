@@ -46,14 +46,14 @@ Flint is composed of four independently running processes that share a PostgreSQ
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          Client (Browser)                           │
-│                     Next.js — app.yourdomain.com                    │
+│                     Next.js — flint.muizzyranking.com               │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │ HTTPS
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                            Nginx                                    │
 │                     Reverse Proxy + SSL                             │
-│         api.yourdomain.com → :8000    app.yourdomain.com → :3000    │
+  api.flint.muizzyranking.com → :8000    flint.muizzyranking.com → :3000    │
 └────────────────┬──────────────────────────────────┬─────────────────┘
                  │                                  │
                  ▼                                  ▼
@@ -150,7 +150,7 @@ The scheduler is a single long-running process with two internal loops:
 
 ### PostgreSQL
 
-The primary source of truth. All job state lives here. Redis is a cache and coordination layer — PostgreSQL is what you trust.
+The primary source of truth. All job state lives here. Redis is a cache and coordination layer — PostgreSQL is what is trusted.
 
 Key design decisions:
 - UUID primary keys throughout for safe distributed generation
@@ -169,7 +169,7 @@ Redis serves three purposes:
 
 ### Mailhog
 
-A local SMTP server that catches all outgoing email. Used as the mock external email service for the `send_email` job handler and for DLQ alert emails. Its web UI (port 8025) lets you inspect delivered emails during development.
+A local SMTP server that catches all outgoing email. Used as the mock external email service for the `send_email` job handler and for DLQ alert emails. Its web UI (port 8025) allows inspecting delivered emails during development.
 
 ---
 
@@ -266,10 +266,10 @@ settings (standalone key-value store)
 ### Key Design Decisions
 
 **Why `effective_priority` as a separate column from `priority`?**
-The raw `priority` (1, 2, 3) is the user-assigned value. `effective_priority` is the scheduler's working value — it starts equal to `priority` and is decremented by the aging process. Keeping them separate means we can always report the original priority to the user while the scheduler works with the aged value internally.
+The raw `priority` (1, 2, 3) is the user-assigned value. `effective_priority` is the scheduler's working value — it starts equal to `priority` and is decremented by the aging process. Keeping them separate means that the original priority can always be reported while the scheduler works with the aged value internally.
 
 **Why soft delete?**
-Job history is valuable. Engineers investigating failures want to see jobs that were deleted. Soft delete lets the system maintain a bin with restore capability while keeping normal queries clean via `WHERE deleted_at IS NULL`.
+Job history is valuable. Soft delete lets the system maintain a bin with restore capability while keeping normal queries clean via `WHERE deleted_at IS NULL`.
 
 **Why JSONB for `payload`?**
 Job payloads are handler-specific and vary in structure. JSONB gives full flexibility without requiring a schema change for each new handler type. PostgreSQL's JSONB indexing also allows future querying on payload fields if needed.
@@ -425,7 +425,7 @@ When a job fails permanently (exhausts retries, goes to DLQ):
 
 ### Cascade Retry (Option A)
 
-When an engineer manually retries a DLQ job that has downstream dependents:
+When a DLQ job that has downstream dependents is manually retried:
 - The job is reset to `pending` with `retry_count = 0`
 - All downstream `cancelled` jobs whose `last_error` contains `"dependency"` are also reset to `pending`
 - The cascade recurses through the full downstream graph
@@ -677,7 +677,7 @@ All log output is structured JSON produced by `structlog`. Every log entry conta
 
 ### Log Viewer
 
-The API exposes `GET /api/v1/logs` which reads from the log file and returns paginated, filterable log entries. The frontend has a Logs page that displays these. This gives engineers visibility into system events without SSH access.
+The API exposes `GET /api/v1/logs` which reads from the log file and returns paginated, filterable log entries. The frontend has a Logs page that displays these. This gives the visibility into system events without SSH access.
 
 ---
 
@@ -704,9 +704,10 @@ Structlog processors are configured to scrub sensitive fields (e.g. `api_key`, `
 ```
 VPS (Ubuntu 24 LTS)
 │
+├── Nginx (port 80, 443)
+│
 ├── Docker Engine
 │   └── Docker Compose
-│       ├── nginx          (port 80, 443)
 │       ├── api            (port 8000, internal)
 │       ├── worker-1       (no port, internal)
 │       ├── worker-2       (no port, internal)
@@ -728,10 +729,10 @@ VPS (Ubuntu 24 LTS)
 ### Nginx Routing
 
 ```nginx
-# api.yourdomain.com → FastAPI
+# api.flint.muizzyranking.com → FastAPI
 server {
     listen 443 ssl;
-    server_name api.yourdomain.com;
+    server_name api.flint.muizzyranking.com;
 
     location / {
         proxy_pass http://api:8000;
@@ -747,10 +748,10 @@ server {
     }
 }
 
-# app.yourdomain.com → Next.js
+# flint.muizzyranking.com → Next.js
 server {
     listen 443 ssl;
-    server_name app.yourdomain.com;
+    server_name flint.muizzyranking.com;
 
     location / {
         proxy_pass http://frontend:3000;
