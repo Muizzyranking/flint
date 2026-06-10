@@ -2209,7 +2209,7 @@ async def send_dlq_alert(dlq_count: int, session):
         dlq_count=dlq_count,
         threshold=await get_setting("dlq_threshold", session),
         jobs=recent_dlq_jobs,
-        dashboard_url=f"https://app.yourdomain.com/dlq",
+        dashboard_url=f"https://flint.muizzyranking.com/dlq",
         app_name="Flint"
     )
 
