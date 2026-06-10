@@ -23,3 +23,8 @@ select = [ "E", "F", "I", "B", "UP" ]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

@@ -281,6 +281,11 @@ dependencies = [
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "httpx" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.18.4" },
@@ -347,6 +352,9 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/df/4e/750c15c317a41ffb36f0bf40b933e3d744a7dede61889f74443ea69690cf/greenlet-3.5.1-cp315-cp315t-win_amd64.whl", hash = "sha256:e7516cf6ae6b8a582c2770a0caed47b8a48373ed732c33d69a72913ae6ac923e", size = 245225, upload-time = "2026-05-20T13:13:59.366Z" },
     { url = "https://files.pythonhosted.org/packages/4f/fd/d3baea2eeb7b617efd47e87ca06e2ec2c6118d303aa9e918e0ce16eadc10/greenlet-3.5.1-cp315-cp315t-win_arm64.whl", hash = "sha256:5028648bf2253ec4745add746129d3904121fa7fe871a76bed23c5720573ce0a", size = 239590, upload-time = "2026-05-20T13:13:37.382Z" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "httpx", specifier = ">=0.28.1" }]
 
 [[package]]
 name = "gunicorn"
