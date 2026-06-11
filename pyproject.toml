@@ -31,4 +31,12 @@ dev = [
     "httpx>=0.28.1",
     "httpx2>=2.3.0",
     "ruff>=0.15.16",
+    "taskipy>=1.14.1",
 ]
+
+[tool.taskipy.tasks]
+dev = "uvicorn app.main:app --reload "
+migrate = "alembic upgrade head"
+test = "pytest tests/"
+lint = "ruff check ."
+format = "ruff format ."
