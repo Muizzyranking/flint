@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{% block title %}Flint Notification{% endblock %}</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: #0f0f0f;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #e5e5e5;
+      }
+      .wrapper {
+        width: 100%;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 32px 16px;
+      }
+      .header {
+        background-color: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 8px 8px 0 0;
+        padding: 24px 32px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .logo-text {
+        font-size: 22px;
+        font-weight: 700;
+        color: #f97316;
+        letter-spacing: -0.5px;
+      }
+      .logo-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        background: #f97316;
+        border-radius: 50%;
+        margin-left: 2px;
+        vertical-align: middle;
+      }
+      .tagline {
+        font-size: 11px;
+        color: #6b7280;
+        margin-top: 2px;
+      }
+      .body {
+        background-color: #141414;
+        border: 1px solid #2a2a2a;
+        border-top: none;
+        padding: 32px;
+      }
+      .footer {
+        background-color: #0f0f0f;
+        border: 1px solid #2a2a2a;
+        border-top: none;
+        border-radius: 0 0 8px 8px;
+        padding: 16px 32px;
+        text-align: center;
+        font-size: 11px;
+        color: #4b5563;
+      }
+      h2 {
+        font-size: 18px;
+        font-weight: 600;
+        color: #f3f4f6;
+        margin: 0 0 16px;
+      }
+      p {
+        font-size: 14px;
+        color: #d1d5db;
+        line-height: 1.6;
+        margin: 0 0 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+        font-size: 13px;
+      }
+      th {
+        background: #1f1f1f;
+        color: #9ca3af;
+        font-weight: 600;
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid #2a2a2a;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid #1f1f1f;
+        color: #d1d5db;
+        vertical-align: top;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      tr:hover td {
+        background: #1a1a1a;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 9999px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .badge-error {
+        background: #450a0a;
+        color: #fca5a5;
+      }
+      .cta-btn {
+        display: inline-block;
+        margin-top: 20px;
+        padding: 10px 24px;
+        background: #f97316;
+        color: #000 !important;
+        text-decoration: none;
+        border-radius: 6px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .error-text {
+        font-family: "Courier New", monospace;
+        font-size: 11px;
+        color: #f87171;
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .mono {
+        font-family: "Courier New", monospace;
+        font-size: 12px;
+        color: #a78bfa;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="header">
+        <div>
+          <div class="logo-text">
+            &#9670; Flint<span class="logo-dot"></span>
+          </div>
+          <div class="tagline">{{ tagline }}</div>
+        </div>
+      </div>
+      <div class="body">{% block content %}{% endblock %}</div>
+      <div class="footer">
+        Flint &mdash; {{ tagline }}<br />
+        This is an automated alert. Do not reply to this email.
+      </div>
+    </div>
+  </body>
+</html>

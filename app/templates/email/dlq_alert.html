@@ -1,0 +1,61 @@
+{% extends "base.html" %} {% block title %}Flint DLQ Alert — {{ dlq_count }}
+Failed Jobs{% endblock %} {% block content %}
+<h2>⚠️ Dead Letter Queue Threshold Reached</h2>
+
+<p>
+  <strong style="color: #fbbf24">{{ dlq_count }}</strong>
+  failed job{{ 's' if dlq_count != 1 else '' }} have accumulated in the Dead
+  Letter Queue. Your configured threshold is
+  <strong style="color: #f97316">{{ threshold }}</strong>.
+</p>
+
+<p>
+  These jobs exhausted all retry attempts and require manual inspection. Review
+  the error details below and retry each job once the underlying issue has been
+  resolved.
+</p>
+
+{% if jobs %}
+<table>
+  <thead>
+    <tr>
+      <th>Job ID</th>
+      <th>Type</th>
+      <th>Error</th>
+      <th>Retries</th>
+      <th>Failed At</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for job in jobs %}
+    <tr>
+      <td class="mono">{{ job.short_id }}</td>
+      <td>
+        <span class="badge badge-error">{{ job.type }}</span>
+      </td>
+      <td>
+        <div class="error-text" title="{{ job.last_error }}">
+          {{ job.last_error | truncate(80, true, '...') }}
+        </div>
+      </td>
+      <td style="color: #9ca3af">
+        {{ job.retry_count }}/{{ job.max_retries }}
+      </td>
+      <td style="color: #6b7280; font-size: 11px">{{ job.updated_at }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p style="color: #6b7280">No job details available.</p>
+{% endif %}
+
+<p>
+  Use the Flint dashboard to inspect error details, fix the underlying issue,
+  and manually retry each job.
+</p>
+
+<a href="{{ dashboard_url }}" class="cta-btn">
+  View Dead Letter Queue &rarr;
+</a>
+{% endblock %}
