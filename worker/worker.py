@@ -121,18 +121,15 @@ class FlintWorker:
         if not items:
             return None
 
-        job_id, score = (
-            items[0],
-            float(items[1]) if len(items) > 1 else float(items[0][1]),
-        )
+        job_id = items[0]  # float(items[1]) if len(items) > 1 else float(items[0][1]),
 
         # Handle both tuple and flat list responses
         if isinstance(items[0], (list, tuple)):
             job_id = items[0][0]
-            score = float(items[0][1])
+            # score = float(items[0][1])
         else:
             job_id = items[0]
-            score = float(items[1])
+            # score = float(items[1])
 
         return str(job_id)
 

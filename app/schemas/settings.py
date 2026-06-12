@@ -46,10 +46,10 @@ class SettingsUpdate(BaseModel):
                 val = int(v)
                 if val < 1:
                     raise ValueError
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
                 raise ValueError(
                     "dlq_threshold must be a positive integer string e.g. '5'."
-                )
+                ) from e
         return v
 
     @field_validator("alert_emails")
@@ -63,11 +63,11 @@ class SettingsUpdate(BaseModel):
                 for email in parsed:
                     if not isinstance(email, str) or "@" not in email:
                         raise ValueError(f"Invalid email address: '{email}'")
-            except (ValueError, TypeError, json.JSONDecodeError):
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
                 raise ValueError(
                     "alert_emails must be a JSON array of email strings. "
                     'Example: \'["admin@example.com", "oncall@example.com"]\''
-                )
+                ) from e
         return v
 
     @field_validator("scheduler_strategy")

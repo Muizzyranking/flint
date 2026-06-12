@@ -32,7 +32,7 @@ def error_response(
 
     Args:
         message: Human-readable summary of the error.
-        errors: List of error detail dicts. Each may have 'field' (optional) and 'message'.
+        errors: List of error detail dicts. Each may have 'field' and 'message'.
         status_code: HTTP status code. Default 400.
     """
     body = {
