@@ -125,7 +125,7 @@ class JobLogResponse(BaseModel):
     job_id: UUID
     event: str
     message: str
-    metadata_: dict[str, Any] | None = Field(None, alias="metadata")
+    metadata_: dict[str, Any] | None = Field(None, serialization_alias="metadata")
     created_at: datetime
 
     model_config = {
