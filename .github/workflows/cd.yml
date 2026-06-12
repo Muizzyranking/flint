@@ -28,3 +28,4 @@ jobs:
             docker-compose down
             docker-compose up -d --build
             docker system prune -f
+            sudo nginx -t && sudo systemctl reload nginx
