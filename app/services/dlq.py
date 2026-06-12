@@ -192,12 +192,10 @@ async def retry_dlq_job(
 
     logger.info("dlq_job_retried", job_id=str(job_id))
 
-    # Cascade reset downstream auto-cancelled dependents
     from app.services import dag
 
     await dag.on_dag_root_retried(job_id, db)
 
-    # Re-evaluate DAG: push to queue only if all deps are met
     has_unmet = await dag.has_unmet_dependencies(job_id, db)
     if not has_unmet:
         await queue.push(
@@ -206,14 +204,14 @@ async def retry_dlq_job(
             scheduled_at=job.scheduled_at.timestamp(),
             created_at=job.created_at.timestamp(),
         )
-        # Also sync to Redis sorted set
-        from app.services.job_service import _sync_job_to_redis
+        from app.services.job import _sync_job_to_redis
 
         await _sync_job_to_redis(str(job_id), float(job.priority))
 
     await db.commit()
 
     refreshed = await db.get(Job, job_id)
+    assert refreshed is not None
     return refreshed
 
 
