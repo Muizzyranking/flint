@@ -1,15 +1,14 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from app.core.exceptions import FlintException
-from app.core.security import verify_api_key
 from app.dependencies import DBSession, PaginationParams
 from app.schemas.job import JobResponse
 from app.schemas.response import ApiResponse, Meta, error_response
 from app.services import job
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter()
 
 
 @router.get(

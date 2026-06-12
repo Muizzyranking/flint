@@ -1,10 +1,9 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
-from app.core.security import verify_api_key
 from app.schemas.benchmark import BenchmarkRequest, BenchmarkResult
 from app.schemas.response import ApiResponse
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter()
 
 
 @router.post(
