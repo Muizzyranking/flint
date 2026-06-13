@@ -1,20 +1,4 @@
-"""
-Aging process — starvation prevention.
-
-Decrements effective_priority on long-waiting pending jobs
-and updates their score in the HeapQueue directly.
-
-Called every AGING_INTERVAL seconds from worker/main.py.
-Operates on the shared HeapQueue instance.
-
-Thresholds:
-    Medium priority (2): waiting > 2 minutes → begin aging
-    Low priority (3):    waiting > 5 minutes → begin aging
-
-Decrement: 0.1 per cycle. Floor: 1.0 (never below High priority).
-"""
-
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import Float, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +21,7 @@ class AgingProcess:
           2. For each updated job, call queue.update_priority() on the heap
           3. Log and return summary
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         medium_cutoff = now - timedelta(seconds=settings.MEDIUM_PRIORITY_AGE_THRESHOLD)
         low_cutoff = now - timedelta(seconds=settings.LOW_PRIORITY_AGE_THRESHOLD)
