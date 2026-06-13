@@ -3,7 +3,6 @@ import math
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,49 +12,57 @@ from app.db.session import AsyncSessionLocal
 from app.handlers import get_handler
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog, LogEvent
-from app.services import dag as dag_service
+from app.queues.heapq import HeapQueue
+from app.services import dag
 from app.services.dlq import send_to_dlq
-from app.services.job import (
-    _publish_sse_event,
-    _sync_job_to_redis,
-)
-
-if TYPE_CHECKING:
-    from app.queues.base import BaseQueue
 
 logger = get_logger(__name__)
+
+_EVENTS_CHANNEL = "flint:events"
 
 
 def calculate_next_retry_delay(attempt: int) -> float:
     """
-    Exponential backoff with jitter.
+    Exponential backoff with full jitter.
     """
     base = math.pow(5, attempt - 1)
-    jitter = base * random.uniform(0.5, 1.5)
-    return round(jitter, 2)
+    return round(base * random.uniform(0.5, 1.5), 2)
+
+
+async def _publish_sse(event: dict) -> None:
+    """Publish a job status event to Redis pub/sub for SSE streaming."""
+    import json
+
+    import redis.asyncio as aioredis
+
+    from app.core.config import settings
+
+    try:
+        redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        await redis.publish(_EVENTS_CHANNEL, json.dumps(event))
+        await redis.aclose()
+    except Exception as exc:
+        logger.error("sse_publish_error", error=str(exc))
 
 
 class JobProcessor:
-    def __init__(self, worker_id: str, queue: "BaseQueue") -> None:
+    def __init__(self, worker_id: str, queue: HeapQueue) -> None:
         self.worker_id = worker_id
         self.queue = queue
 
     async def process(self, job_id: str) -> None:
-        """
-        Full job processing flow for a single job.
-        """
-        async with AsyncSessionLocal() as db:
-            job = await self._load_job(job_id, db)
+        """Full processing lifecycle for a single job."""
+        async with AsyncSessionLocal() as session:
+            job = await self._load_job(job_id, session)
             if not job:
                 return
 
-            claimed = await self._claim_job(job.id, db)
+            claimed = await self._claim_job(job.id, session)
             if not claimed:
                 logger.info(
                     "job_claim_failed",
                     job_id=job_id,
                     worker_id=self.worker_id,
-                    reason="already_claimed",
                 )
                 return
 
@@ -64,9 +71,9 @@ class JobProcessor:
                 event=LogEvent.JOB_STARTED,
                 message=f"Job started by worker {self.worker_id}.",
                 metadata={"worker_id": self.worker_id},
-                db=db,
+                session=session,
             )
-            await _publish_sse_event(
+            await _publish_sse(
                 {
                     "job_id": job_id,
                     "status": JobStatus.PROCESSING,
@@ -82,11 +89,9 @@ class JobProcessor:
                 retry_count=job.retry_count,
             )
 
-            if await self._is_cancellation_requested(job.id, db):
+            if await self._is_cancelled(job.id, session):
                 await self._mark_cancelled(
-                    job.id,
-                    db,
-                    reason="cancellation_requested_before_execute",
+                    job.id, session, "cancellation_requested_before_execute"
                 )
                 return
 
@@ -95,29 +100,26 @@ class JobProcessor:
                 handler = get_handler(job.type)
                 result = await handler.execute(job.payload)
             except Exception as exc:
-                elapsed_ms = self._elapsed_ms(start_time)
+                elapsed = self._elapsed_ms(start_time)
                 logger.warning(
                     "job_execution_failed",
                     job_id=job_id,
-                    type=job.type,
                     error=str(exc),
-                    elapsed_ms=elapsed_ms,
+                    elapsed_ms=elapsed,
                     retry_count=job.retry_count,
                 )
-                await self._handle_failure(job, exc, db)
+                await self._handle_failure(job, exc, session)
                 return
 
-            elapsed_ms = self._elapsed_ms(start_time)
+            elapsed = self._elapsed_ms(start_time)
 
-            if await self._is_cancellation_requested(job.id, db):
+            if await self._is_cancelled(job.id, session):
                 await self._mark_cancelled(
-                    job.id,
-                    db,
-                    reason="cancellation_requested_after_execute",
+                    job.id, session, "cancellation_requested_after_execute"
                 )
                 return
 
-            await db.execute(
+            await session.execute(
                 update(Job)
                 .where(Job.id == job.id)
                 .values(
@@ -131,56 +133,45 @@ class JobProcessor:
             await self._log_event(
                 job_id=job.id,
                 event=LogEvent.JOB_COMPLETED,
-                message=(
-                    f"Job completed successfully by worker {self.worker_id} "
-                    f"in {elapsed_ms}ms."
-                ),
+                message=f"Job completed by worker {self.worker_id} in {elapsed}ms.",
                 metadata={
                     "worker_id": self.worker_id,
-                    "duration_ms": elapsed_ms,
+                    "duration_ms": elapsed,
                     "result": result,
                 },
-                db=db,
+                session=session,
             )
-            await db.commit()
+            await session.commit()
 
             logger.info(
                 "job_completed",
                 job_id=job_id,
                 type=job.type,
                 worker_id=self.worker_id,
-                duration_ms=elapsed_ms,
+                duration_ms=elapsed,
             )
 
-            await _publish_sse_event(
+            await _publish_sse(
                 {
                     "job_id": job_id,
                     "status": JobStatus.COMPLETED,
                     "worker_id": self.worker_id,
-                    "duration_ms": elapsed_ms,
+                    "duration_ms": elapsed,
                 }
             )
 
-            await dag_service.on_job_completed(job.id, db, self.queue)
+            await dag.on_job_completed(job.id, session, self.queue)
 
             if job.interval_seconds:
-                await self._handle_recurrence(job, db)
+                await self._handle_recurrence(job, session)
 
-    async def _claim_job(
-        self,
-        job_id: uuid.UUID,
-        db: AsyncSession,
-    ) -> bool:
+    async def _claim_job(self, job_id: uuid.UUID, session: AsyncSession) -> bool:
         """
-        Atomic claim via single UPDATE with WHERE guard.
-
-        Only succeeds if status='pending' AND worker_id IS NULL.
-        If two workers race, exactly one gets the row back.
-        PostgreSQL row-level locking guarantees atomicity.
-
-        Returns True if this worker successfully claimed the job.
+        Atomically claim a job.
+        Returns True only if this worker successfully set worker_id.
+        PostgreSQL row-level atomicity ensures only one winner.
         """
-        result = await db.execute(
+        result = await session.execute(
             update(Job)
             .where(
                 Job.id == job_id,
@@ -196,18 +187,15 @@ class JobProcessor:
             )
             .returning(Job.id)
         )
-        await db.commit()
+        await session.commit()
         return result.scalar_one_or_none() is not None
 
     async def _handle_failure(
         self,
         job: Job,
         error: Exception,
-        db: AsyncSession,
+        session: AsyncSession,
     ) -> None:
-        """
-        Handle a job execution failure.
-        """
         new_retry_count = job.retry_count + 1
         error_str = str(error)
 
@@ -215,7 +203,7 @@ class JobProcessor:
             delay = calculate_next_retry_delay(new_retry_count)
             next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
 
-            await db.execute(
+            await session.execute(
                 update(Job)
                 .where(Job.id == job.id)
                 .values(
@@ -232,19 +220,18 @@ class JobProcessor:
                 job_id=job.id,
                 event=LogEvent.JOB_RETRY_ATTEMPTED,
                 message=(
-                    f"Job failed on attempt {new_retry_count}/{job.max_retries}. "
+                    f"Attempt {new_retry_count}/{job.max_retries} failed. "
                     f"Retrying in {delay:.1f}s. Error: {error_str[:200]}"
                 ),
                 metadata={
                     "attempt": new_retry_count,
-                    "max_retries": job.max_retries,
                     "delay_seconds": delay,
                     "error": error_str[:500],
                     "next_retry_at": next_retry_at.isoformat(),
                 },
-                db=db,
+                session=session,
             )
-            await db.commit()
+            await session.commit()
 
             logger.warning(
                 "job_retry_attempted",
@@ -252,10 +239,9 @@ class JobProcessor:
                 attempt=new_retry_count,
                 max_retries=job.max_retries,
                 delay_seconds=delay,
-                error=error_str[:200],
             )
 
-            await _publish_sse_event(
+            await _publish_sse(
                 {
                     "job_id": str(job.id),
                     "status": JobStatus.PENDING,
@@ -263,30 +249,20 @@ class JobProcessor:
                 }
             )
 
-            asyncio.create_task(
-                self._retry_after_delay(
-                    job_id=str(job.id),
-                    effective_priority=job.effective_priority,
-                    scheduled_at=next_retry_at.timestamp(),
-                    created_at=job.created_at.timestamp(),
-                    delay=delay,
-                )
-            )
+            asyncio.create_task(self._requeue_after_delay(job, next_retry_at, delay))
 
         else:
-            await db.execute(
+            await session.execute(
                 update(Job)
                 .where(Job.id == job.id)
                 .values(
-                    retry_count=new_retry_count,
-                    worker_id=None,
-                    updated_at=func.now(),
+                    retry_count=new_retry_count, worker_id=None, updated_at=func.now()
                 )
             )
-            await db.flush()
-            await send_to_dlq(job.id, error_str[:1000], db)
+            await session.flush()
+            await send_to_dlq(job.id, error_str[:1000], session)
 
-            await _publish_sse_event(
+            await _publish_sse(
                 {
                     "job_id": str(job.id),
                     "status": JobStatus.FAILED,
@@ -294,45 +270,31 @@ class JobProcessor:
                 }
             )
 
-    async def _retry_after_delay(
+    async def _requeue_after_delay(
         self,
-        job_id: str,
-        effective_priority: float,
-        scheduled_at: float,
-        created_at: float,
+        job: Job,
+        next_retry_at: datetime,
         delay: float,
     ) -> None:
         """
-        Background task: wait for the backoff delay then push the
-        job back onto the queue so it gets picked up again.
+        Wait for the backoff delay then push the job back into the heap.
+        The scheduler would also pick it up on its next poll — whichever
+        happens first, the atomic claim prevents double-processing.
         """
         await asyncio.sleep(delay)
         try:
             await self.queue.push(
-                job_id=job_id,
-                effective_priority=effective_priority,
-                scheduled_at=scheduled_at,
-                created_at=created_at,
+                job_id=str(job.id),
+                effective_priority=job.effective_priority,
+                scheduled_at=next_retry_at.timestamp(),
+                created_at=job.created_at.timestamp(),
             )
-            await _sync_job_to_redis(job_id, effective_priority)
-            logger.info("job_retry_queued", job_id=job_id, delay=delay)
+            logger.info("job_retry_requeued", job_id=str(job.id), delay=delay)
         except Exception as exc:
-            logger.error(
-                "job_retry_queue_error",
-                job_id=job_id,
-                error=str(exc),
-            )
+            logger.error("job_retry_requeue_error", job_id=str(job.id), error=str(exc))
 
-    async def _is_cancellation_requested(
-        self,
-        job_id: uuid.UUID,
-        db: AsyncSession,
-    ) -> bool:
-        """
-        Check the cancellation_requested flag from the DB.
-        Called at checkpoints during processing.
-        """
-        result = await db.execute(
+    async def _is_cancelled(self, job_id: uuid.UUID, session: AsyncSession) -> bool:
+        result = await session.execute(
             select(Job.cancellation_requested).where(Job.id == job_id)
         )
         return bool(result.scalar_one_or_none())
@@ -343,34 +305,23 @@ class JobProcessor:
         session: AsyncSession,
         reason: str = "cancellation_requested",
     ) -> None:
-        """Mark a job as cancelled and publish SSE event."""
         await session.execute(
             update(Job)
             .where(Job.id == job_id)
-            .values(
-                status=JobStatus.CANCELLED,
-                worker_id=None,
-                updated_at=func.now(),
-            )
+            .values(status=JobStatus.CANCELLED, worker_id=None, updated_at=func.now())
         )
-
         await self._log_event(
             job_id=job_id,
             event=LogEvent.JOB_CANCELLED,
-            message=(f"Job cancelled by worker {self.worker_id}. Reason: {reason}."),
+            message=f"Job cancelled by worker {self.worker_id}. Reason: {reason}.",
             metadata={"worker_id": self.worker_id, "reason": reason},
-            db=session,
+            session=session,
         )
         await session.commit()
 
-        logger.info(
-            "job_cancelled",
-            job_id=str(job_id),
-            worker_id=self.worker_id,
-            reason=reason,
-        )
+        logger.info("job_cancelled", job_id=str(job_id), reason=reason)
 
-        await _publish_sse_event(
+        await _publish_sse(
             {
                 "job_id": str(job_id),
                 "status": JobStatus.CANCELLED,
@@ -378,19 +329,10 @@ class JobProcessor:
             }
         )
 
-    async def _handle_recurrence(
-        self,
-        job: Job,
-        session: AsyncSession,
-    ) -> None:
-        """
-        Schedule the next run of a recurring job.
-        """
-
+    async def _handle_recurrence(self, job: Job, session: AsyncSession) -> None:
         if not job.interval_seconds:
             return
-
-        next_run = datetime.now(UTC) + timedelta(seconds=float(job.interval_seconds))
+        next_run = datetime.now(UTC) + timedelta(seconds=job.interval_seconds)
 
         new_job = Job(
             type=job.type,
@@ -409,44 +351,43 @@ class JobProcessor:
         await self._log_event(
             job_id=new_job.id,
             event=LogEvent.RECURRING_SCHEDULED,
-            message=(
-                f"Recurring job scheduled. Next run at {next_run.isoformat()}. "
-                f"Parent job: {job.id}."
-            ),
+            message=f"Next run scheduled at {next_run.isoformat()}. Parent: {job.id}.",
             metadata={
                 "parent_job_id": str(job.id),
                 "interval_seconds": job.interval_seconds,
                 "next_run": next_run.isoformat(),
             },
-            db=session,
+            session=session,
         )
         await session.commit()
+
+        now = datetime.now(UTC)
+        if next_run <= now:
+            await self.queue.push(
+                job_id=str(new_job.id),
+                effective_priority=float(job.priority),
+                scheduled_at=next_run.timestamp(),
+                created_at=new_job.created_at.timestamp()
+                if new_job.created_at
+                else now.timestamp(),
+            )
 
         logger.info(
             "recurring_job_scheduled",
             parent_job_id=str(job.id),
             new_job_id=str(new_job.id),
             next_run=next_run.isoformat(),
-            interval_seconds=job.interval_seconds,
         )
 
-    async def _load_job(
-        self,
-        job_id: str,
-        db: AsyncSession,
-    ) -> Job | None:
-        """Load a job by string ID. Returns None if not found."""
+    async def _load_job(self, job_id: str, session: AsyncSession) -> Job | None:
         try:
             parsed_id = uuid.UUID(job_id)
         except ValueError:
             logger.error("invalid_job_id", job_id=job_id)
             return None
 
-        result = await db.execute(
-            select(Job).where(
-                Job.id == parsed_id,
-                Job.deleted_at.is_(None),
-            )
+        result = await session.execute(
+            select(Job).where(Job.id == parsed_id, Job.deleted_at.is_(None))
         )
         return result.scalar_one_or_none()
 
@@ -456,20 +397,17 @@ class JobProcessor:
         event: str,
         message: str,
         metadata: dict,
-        db: AsyncSession,
+        session: AsyncSession,
     ) -> None:
-        """Write a structured log entry to the job_logs table."""
         log_entry = JobLog(
             job_id=job_id,
             event=event,
             message=message,
             metadata_=metadata,
         )
-        db.add(log_entry)
-        await db.flush()
+        session.add(log_entry)
+        await session.flush()
 
     @staticmethod
     def _elapsed_ms(start: datetime) -> int:
-        """Return elapsed milliseconds since start."""
-        delta = datetime.now(UTC) - start
-        return int(delta.total_seconds() * 1000)
+        return int((datetime.now(UTC) - start).total_seconds() * 1000)

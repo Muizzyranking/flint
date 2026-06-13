@@ -1,16 +1,28 @@
-from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+"""
+Aging process — starvation prevention.
 
-from sqlalchemy import func, select, update
+Decrements effective_priority on long-waiting pending jobs
+and updates their score in the HeapQueue directly.
+
+Called every AGING_INTERVAL seconds from worker/main.py.
+Operates on the shared HeapQueue instance.
+
+Thresholds:
+    Medium priority (2): waiting > 2 minutes → begin aging
+    Low priority (3):    waiting > 5 minutes → begin aging
+
+Decrement: 0.1 per cycle. Floor: 1.0 (never below High priority).
+"""
+
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import Float, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.models.job import Job, JobPriority, JobStatus
-
-if TYPE_CHECKING:
-    from app.queues.base import BaseQueue
-
+from app.queues.heapq import HeapQueue
 
 logger = get_logger(__name__)
 
@@ -18,39 +30,26 @@ _PRIORITY_FLOOR = 1.0
 
 
 class AgingProcess:
-    """
-    Decrements effective_priority on long-waiting pending jobs.
-    """
-
-    async def run(
-        self,
-        session: AsyncSession,
-        queue: "BaseQueue",
-    ) -> dict:
+    async def run(self, session: AsyncSession, queue: HeapQueue) -> dict:
         """
-        Execute one aging cycle.
+        One aging cycle:
+          1. Decrement effective_priority for qualifying medium + low jobs in DB
+          2. For each updated job, call queue.update_priority() on the heap
+          3. Log and return summary
         """
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         medium_cutoff = now - timedelta(seconds=settings.MEDIUM_PRIORITY_AGE_THRESHOLD)
         low_cutoff = now - timedelta(seconds=settings.LOW_PRIORITY_AGE_THRESHOLD)
 
-        medium_count = await self._age_priority(
-            priority=JobPriority.MEDIUM,
-            cutoff=medium_cutoff,
-            db=session,
-        )
-
-        low_count = await self._age_priority(
-            priority=JobPriority.LOW,
-            cutoff=low_cutoff,
-            db=session,
-        )
+        medium_count = await self._age(JobPriority.MEDIUM, medium_cutoff, session)
+        low_count = await self._age(JobPriority.LOW, low_cutoff, session)
 
         await session.commit()
 
+        # Sync updated priorities into the heap
         if medium_count > 0 or low_count > 0:
-            await self._sync_queue(session, queue)
+            await self._sync_heap(session, queue)
 
         summary = {
             "medium_jobs_aged": medium_count,
@@ -58,28 +57,16 @@ class AgingProcess:
             "total_aged": medium_count + low_count,
             "timestamp": now.isoformat(),
         }
-
-        logger.info(
-            "aging_complete",
-            **summary,
-        )
-
+        logger.info("aging_complete", **summary)
         return summary
 
-    async def _age_priority(
-        self,
-        priority: int,
-        cutoff: datetime,
-        db: AsyncSession,
-    ) -> int:
+    async def _age(self, priority: int, cutoff: datetime, session: AsyncSession) -> int:
         """
-        Decrement effective_priority for all pending jobs of a given
-        priority level that have been waiting since before the cutoff.
-
-        Uses GREATEST() to floor at _PRIORITY_FLOOR (1.0).
-        Returns the number of rows updated.
+        Decrement effective_priority for pending jobs of a given priority
+        that have been waiting since before the cutoff.
+        Returns number of rows updated.
         """
-        result = await db.execute(
+        result = await session.execute(
             update(Job)
             .where(
                 Job.status == JobStatus.PENDING,
@@ -98,56 +85,36 @@ class AgingProcess:
             )
             .returning(Job.id)
         )
-        updated_ids = result.fetchall()
-        count = len(updated_ids)
-
+        updated = result.fetchall()
+        count = len(updated)
         if count > 0:
-            logger.info(
-                "jobs_aged",
-                priority=priority,
-                count=count,
-                decrement=settings.AGING_DECREMENT,
-            )
-
+            logger.info("jobs_aged", priority=priority, count=count)
         return count
 
-    async def _sync_queue(
-        self,
-        db: AsyncSession,
-        queue: "BaseQueue",
-    ) -> None:
+    async def _sync_heap(self, session: AsyncSession, queue: HeapQueue) -> None:
         """
-        After aging, fetch all updated pending jobs and re-push them
-        to the queue with their new effective_priority scores.
+        After aging, reload all pending jobs whose effective_priority
+        has dropped below their raw priority and update them in the heap.
         """
-        result = await db.execute(
+        result = await session.execute(
             select(Job).where(
                 Job.status == JobStatus.PENDING,
                 Job.deleted_at.is_(None),
                 Job.is_dlq.is_(False),
-                # Only re-sync jobs that have been aged (below their raw priority)
-                Job.effective_priority
-                < Job.priority.cast(type_=type(Job.effective_priority.type)),
+                Job.effective_priority < cast(Job.priority, Float),
             )
         )
         aged_jobs = result.scalars().all()
 
         for job in aged_jobs:
             try:
-                await queue.update_priority(
-                    job_id=str(job.id),
-                    new_priority=job.effective_priority,
-                    scheduled_at=job.scheduled_at.timestamp(),
-                    created_at=job.created_at.timestamp(),
-                )
-
-                # Also update Redis sorted set score
-                from app.services.job import _sync_job_to_redis
-
-                await _sync_job_to_redis(
-                    str(job.id),
-                    job.effective_priority,
-                )
+                if await queue.contains(str(job.id)):
+                    await queue.update_priority(
+                        job_id=str(job.id),
+                        new_priority=job.effective_priority,
+                        scheduled_at=job.scheduled_at.timestamp(),
+                        created_at=job.created_at.timestamp(),
+                    )
             except Exception as exc:
                 logger.error(
                     "aging_sync_error",
