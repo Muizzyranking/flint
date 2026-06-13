@@ -43,12 +43,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  worker-1:
+  worker:
     build: .
-    command: uv run python -m worker.worker
+    command: uv run python -m worker.main
     env_file: .env
     environment:
-      WORKER_ID: worker-1
+      WORKER_COUNT: 2
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flint}
       REDIS_URL: redis://redis:6379/0
     depends_on:
@@ -58,39 +58,6 @@ services:
         condition: service_healthy
     volumes:
       - ./logs:/app/logs
-
-  worker-2:
-    build: .
-    command: uv run python -m worker.worker
-    env_file: .env
-    environment:
-      WORKER_ID: worker-2
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flint}
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./logs:/app/logs
-
-  scheduler:
-    build: .
-    command: uv run python -m scheduler.scheduler
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flint}
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./logs:/app/logs
-
-
 
 volumes:
   postgres_data:
