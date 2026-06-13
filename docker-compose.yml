@@ -59,6 +59,13 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  mailhog:
+    image: mailhog/mailhog
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
