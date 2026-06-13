@@ -152,7 +152,6 @@ class JobResponse(BaseModel):
     completed_at: datetime | None
     is_dlq: bool
     created_at: datetime
-    updated_at: datetime
 
     # Populated on detail endpoint only
     dependencies: list[UUID] | None = None

@@ -6,7 +6,7 @@ import redis.asyncio as aioredis
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings as app_settings
+from app.core.config import settings
 from app.core.exceptions import (
     JobNotCancellableException,
     JobNotDeletableException,
@@ -17,77 +17,45 @@ from app.core.logger import get_logger
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog, LogEvent
 from app.schemas.job import JobCreate, JobFilterParams, parse_interval
-from app.services import dag
+from app.services import dag as dag_service
 
 logger = get_logger(__name__)
 
-QUEUE_KEY = "flint:queue"
 EVENTS_CHANNEL = "flint:events"
 
 
-async def _get_redis() -> aioredis.Redis:
-    """Get a Redis client. Used internally by this service."""
-    return aioredis.from_url(
-        app_settings.REDIS_URL,
-        decode_responses=True,
-        encoding="utf-8",
-    )
-
-
-async def _sync_job_to_redis(job_id: str, effective_priority: float) -> None:
-    """
-    Add a job to the Redis sorted set (flint:queue).
-    Score = effective_priority. Lower score = higher urgency.
-    Workers read from this set to know which job to process next.
-    """
-    redis = await _get_redis()
-    try:
-        await redis.zadd(QUEUE_KEY, {job_id: effective_priority})
-    finally:
-        await redis.aclose()
-
-
-async def _remove_job_from_redis(job_id: str) -> None:
-    """Remove a job from the Redis sorted set."""
-    redis = await _get_redis()
-    try:
-        await redis.zrem(QUEUE_KEY, job_id)
-    finally:
-        await redis.aclose()
-
-
 async def _publish_sse_event(event: dict) -> None:
-    """
-    Publish a job status change event to the Redis pub/sub channel.
-    The SSE endpoint subscribes to this channel and forwards events
-    to connected browser clients.
-    """
-    redis = await _get_redis()
+    """Publish a job status change to the SSE Redis channel."""
     try:
+        redis = aioredis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            encoding="utf-8",
+        )
         await redis.publish(EVENTS_CHANNEL, json.dumps(event))
-    finally:
         await redis.aclose()
+    except Exception as exc:
+        logger.error("sse_publish_error", error=str(exc))
 
 
-async def create_job(
-    data: JobCreate,
-    db: AsyncSession,
-) -> Job:
+async def create_job(data: JobCreate, session: AsyncSession) -> Job:
     """
-    Create a new job and optionally push it to the queue.
+    Create a new job and write it to PostgreSQL.
+
+    The scheduler (worker/main.py) will pick it up on its next poll
+    and push it into the HeapQueue when scheduled_at becomes due
+    and all dependencies are met.
     """
-    # Parse interval
     interval_seconds = None
     if data.interval:
         interval_seconds = parse_interval(data.interval)
 
     dependency_ids = data.dependency_ids or []
+
+    # Validate dependencies and check for cycles
     if dependency_ids:
-        await dag.check_cycle(
-            new_job_id=uuid.uuid4(),  # placeholder — job not yet in DB
-            dependency_ids=dependency_ids,
-            db=db,
-        )
+        temp_id = uuid.uuid4()
+        await dag_service.check_cycle(temp_id, dependency_ids, session)
 
     scheduled_at = data.scheduled_at or datetime.now(UTC)
 
@@ -102,17 +70,13 @@ async def create_job(
         max_retries=data.max_retries,
         retry_count=0,
     )
-    db.add(job)
-    await db.flush()
+    session.add(job)
+    await session.flush()
 
-    # Now run cycle check with the real job ID
+    # Re-run cycle check with the real job ID
     if dependency_ids:
-        await dag.check_cycle(
-            new_job_id=job.id,
-            dependency_ids=dependency_ids,
-            db=db,
-        )
-        await dag.create_dependencies(job.id, dependency_ids, db)
+        await dag_service.check_cycle(job.id, dependency_ids, session)
+        await dag_service.create_dependencies(job.id, dependency_ids, session)
 
     log_entry = JobLog(
         job_id=job.id,
@@ -126,8 +90,8 @@ async def create_job(
             "dependency_count": len(dependency_ids),
         },
     )
-    db.add(log_entry)
-    await db.commit()
+    session.add(log_entry)
+    await session.commit()
 
     logger.info(
         "job_created",
@@ -138,12 +102,7 @@ async def create_job(
         has_dependencies=bool(dependency_ids),
     )
 
-    has_unmet = bool(dependency_ids)
-    is_due = scheduled_at <= datetime.now(UTC)
-
-    if not has_unmet and is_due:
-        await _sync_job_to_redis(str(job.id), job.effective_priority)
-
+    # Notify SSE clients
     await _publish_sse_event(
         {
             "job_id": str(job.id),
@@ -152,21 +111,25 @@ async def create_job(
         }
     )
 
+    # Note: the scheduler will push this job into the HeapQueue
+    # on its next poll cycle when scheduled_at <= NOW and deps are met.
+
     return job
+
+
+# ------------------------------------------------------------------ #
+# Read
+# ------------------------------------------------------------------ #
 
 
 async def get_jobs(
     filters: JobFilterParams,
-    db: AsyncSession,
+    session: AsyncSession,
 ) -> tuple[list[Job], int]:
-    """
-    Return paginated jobs with total count.
-    """
     conditions: list = [
         Job.deleted_at.is_(None),
         Job.is_dlq.is_(False),
     ]
-
     if filters.status:
         conditions.append(Job.status == filters.status)
     if filters.type:
@@ -174,51 +137,31 @@ async def get_jobs(
     if filters.priority:
         conditions.append(Job.priority == int(filters.priority))
     if filters.search:
-        search_term = f"%{filters.search}%"
+        term = f"%{filters.search}%"
         conditions.append(
             or_(
-                Job.type.ilike(search_term),
-                Job.id.cast(db_string_type()).ilike(search_term),
+                Job.type.ilike(term),
+                Job.id.cast(type_=__import__("sqlalchemy").String).ilike(term),
             )
         )
 
-    total_result = await db.execute(select(func.count(Job.id)).where(*conditions))
+    total_result = await session.execute(select(func.count(Job.id)).where(*conditions))
     total = total_result.scalar() or 0
 
     offset = (filters.page - 1) * filters.limit
-    jobs_result = await db.execute(
+    jobs_result = await session.execute(
         select(Job)
         .where(*conditions)
         .order_by(Job.created_at.desc())
         .offset(offset)
         .limit(filters.limit)
     )
-    jobs = list(jobs_result.scalars().all())
-
-    return jobs, total
+    return list(jobs_result.scalars().all()), total
 
 
-def db_string_type():
-    """SQLAlchemy string type for UUID casting in search."""
-    from sqlalchemy import String
-
-    return String
-
-
-async def get_job_by_id(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-    include_logs: bool = False,
-    include_dependencies: bool = False,
-) -> Job:
-    """
-    Fetch a single job by ID.
-    """
-    result = await db.execute(
-        select(Job).where(
-            Job.id == job_id,
-            Job.deleted_at.is_(None),
-        )
+async def get_job_by_id(job_id: uuid.UUID, session: AsyncSession) -> Job:
+    result = await session.execute(
+        select(Job).where(Job.id == job_id, Job.deleted_at.is_(None))
     )
     job = result.scalar_one_or_none()
     if not job:
@@ -228,42 +171,42 @@ async def get_job_by_id(
 
 async def get_job_with_details(
     job_id: uuid.UUID,
-    db: AsyncSession,
+    session: AsyncSession,
 ) -> tuple[Job, list[uuid.UUID], list]:
-    """
-    Fetch a job with its dependency IDs and log entries.
-    """
-    job = await get_job_by_id(job_id, db)
-
-    dependency_ids = await dag.get_dependency_ids(job_id, db)
+    job = await get_job_by_id(job_id, session)
+    dependency_ids = await dag_service.get_dependency_ids(job_id, session)
 
     from sqlalchemy import asc
 
-    from app.models.job_log import JobLog
+    from app.models.job_log import JobLog as JobLogModel
 
-    logs_result = await db.execute(
-        select(JobLog).where(JobLog.job_id == job_id).order_by(asc(JobLog.created_at))
+    logs_result = await session.execute(
+        select(JobLogModel)
+        .where(JobLogModel.job_id == job_id)
+        .order_by(asc(JobLogModel.created_at))
     )
     logs = list(logs_result.scalars().all())
-
     return job, dependency_ids, logs
 
 
-async def cancel_job(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-) -> Job:
+# ------------------------------------------------------------------ #
+# Cancel
+# ------------------------------------------------------------------ #
+
+
+async def cancel_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
     """
-    Request cancellation of a job.
+    Pending jobs: mark cancelled immediately.
+    Processing jobs: set cancellation_requested=True (cooperative).
+    Terminal jobs: raise JobNotCancellableException.
     """
-    job = await get_job_by_id(job_id, db)
+    job = await get_job_by_id(job_id, session)
 
     if not job.is_cancellable:
         raise JobNotCancellableException(str(job_id), job.status)
 
     if job.status == JobStatus.PENDING:
-        # Immediate cancellation
-        await db.execute(
+        await session.execute(
             update(Job)
             .where(Job.id == job_id)
             .values(
@@ -272,180 +215,127 @@ async def cancel_job(
                 updated_at=func.now(),
             )
         )
+        await dag_service.on_job_failed(job_id, session)
 
-        await _remove_job_from_redis(str(job_id))
-
-        # Cascade cancel downstream dependents
-        await dag.on_job_failed(job_id, db)
-
-        log_entry = JobLog(
-            job_id=job_id,
-            event=LogEvent.JOB_CANCELLED,
-            message="Job cancelled by user request while pending.",
-            metadata_={"reason": "user_requested", "was_status": "pending"},
+        session.add(
+            JobLog(
+                job_id=job_id,
+                event=LogEvent.JOB_CANCELLED,
+                message="Job cancelled while pending.",
+                metadata_={"reason": "user_requested", "was_status": "pending"},
+            )
         )
-        db.add(log_entry)
-
         logger.info("job_cancelled", job_id=str(job_id), was_status="pending")
 
     elif job.status == JobStatus.PROCESSING:
-        await db.execute(
+        await session.execute(
             update(Job)
             .where(Job.id == job_id)
-            .values(
-                cancellation_requested=True,
-                updated_at=func.now(),
+            .values(cancellation_requested=True, updated_at=func.now())
+        )
+        session.add(
+            JobLog(
+                job_id=job_id,
+                event=LogEvent.JOB_CANCELLED,
+                message=(
+                    "Cancellation requested while processing. "
+                    "Worker will honour at next checkpoint."
+                ),
+                metadata_={"reason": "user_requested", "was_status": "processing"},
             )
         )
-
-        log_entry = JobLog(
-            job_id=job_id,
-            event=LogEvent.JOB_CANCELLED,
-            message=(
-                "Cancellation requested while job is processing. "
-                "Worker will honour at next checkpoint."
-            ),
-            metadata_={"reason": "user_requested", "was_status": "processing"},
-        )
-        db.add(log_entry)
-
         logger.info(
             "job_cancellation_requested",
             job_id=str(job_id),
             was_status="processing",
         )
 
-    await db.commit()
-
-    await _publish_sse_event(
-        {
-            "job_id": str(job_id),
-            "status": JobStatus.CANCELLED,
-        }
-    )
-
-    job = await db.get(Job, job_id)
+    await session.commit()
+    await _publish_sse_event({"job_id": str(job_id), "status": JobStatus.CANCELLED})
+    job = await session.get(Job, job_id)
     assert job is not None, f"Job {job_id} vanished after cancellation"
     return job
 
 
-async def soft_delete_job(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-) -> None:
-    """
-    Move a job to the bin (sets deleted_at).
-    """
-    job = await get_job_by_id(job_id, db)
+# ------------------------------------------------------------------ #
+# Soft delete / Bin / Restore / Hard delete
+# ------------------------------------------------------------------ #
 
+
+async def soft_delete_job(job_id: uuid.UUID, session: AsyncSession) -> None:
+    job = await get_job_by_id(job_id, session)
     if not job.is_terminal:
         raise JobNotDeletableException(str(job_id), job.status)
-
-    await db.execute(
+    await session.execute(
         update(Job)
         .where(Job.id == job_id)
         .values(deleted_at=func.now(), updated_at=func.now())
     )
-    await db.commit()
-
+    await session.commit()
     logger.info("job_soft_deleted", job_id=str(job_id))
 
 
 async def get_bin_jobs(
-    page: int,
-    limit: int,
-    db: AsyncSession,
+    page: int, limit: int, session: AsyncSession
 ) -> tuple[list[Job], int]:
-    """
-    Return soft-deleted jobs (the bin). Paginated, most recently deleted first.
-    """
     conditions = [Job.deleted_at.isnot(None)]
-
-    total_result = await db.execute(select(func.count(Job.id)).where(*conditions))
-    total = total_result.scalar() or 0
-
+    total = (
+        await session.execute(select(func.count(Job.id)).where(*conditions))
+    ).scalar() or 0
     offset = (page - 1) * limit
-    jobs_result = await db.execute(
-        select(Job)
-        .where(*conditions)
-        .order_by(Job.deleted_at.desc())
-        .offset(offset)
-        .limit(limit)
+    jobs = list(
+        (
+            await session.execute(
+                select(Job)
+                .where(*conditions)
+                .order_by(Job.deleted_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
     )
-    jobs = list(jobs_result.scalars().all())
-
     return jobs, total
 
 
-async def restore_job(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-) -> Job:
-    """
-    Restore a soft-deleted job from the bin.
-    Clears deleted_at. Does not re-queue the job.
-    Raises JobNotInBinException if the job is not soft-deleted.
-    """
-    result = await db.execute(select(Job).where(Job.id == job_id))
+async def restore_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
+    result = await session.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
-
     if not job or job.deleted_at is None:
         raise JobNotInBinException(str(job_id))
-
-    await db.execute(
+    await session.execute(
         update(Job)
         .where(Job.id == job_id)
         .values(deleted_at=None, updated_at=func.now())
     )
-    await db.commit()
-
+    await session.commit()
     logger.info("job_restored", job_id=str(job_id))
-    job = await db.get(Job, job_id)
+    job = await session.get(Job, job_id)
     assert job is not None, f"Job {job_id} vanished after cancellation"
     return job
 
 
-async def hard_delete_job(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-) -> None:
-    """
-    Permanently delete a job from the database.
-    """
-    result = await db.execute(select(Job).where(Job.id == job_id))
+async def hard_delete_job(job_id: uuid.UUID, session: AsyncSession) -> None:
+    result = await session.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
-
     if not job or job.deleted_at is None:
         raise JobNotInBinException(str(job_id))
-
-    await db.delete(job)
-    await db.commit()
-
+    await session.delete(job)
+    await session.commit()
     logger.info("job_hard_deleted", job_id=str(job_id))
 
 
-async def get_job_counts_by_status(
-    db: AsyncSession,
-) -> dict[str, int]:
-    """
-    Return a dict of job counts per status for the dashboard.
-    Excludes soft-deleted jobs. Includes DLQ count separately.
-    """
-
+async def get_job_counts_by_status(session: AsyncSession) -> dict[str, int]:
     from app.services.dlq import get_dlq_count
 
-    results = await db.execute(
+    results = await session.execute(
         select(Job.status, func.count(Job.id))
-        .where(
-            Job.deleted_at.is_(None),
-            Job.is_dlq.is_(False),
-        )
+        .where(Job.deleted_at.is_(None), Job.is_dlq.is_(False))
         .group_by(Job.status)
     )
     counts = {status: count for status, count in results.fetchall()}
-
-    dlq_count = await get_dlq_count(db)
-
+    dlq_count = await get_dlq_count(session)
     return {
         "pending": counts.get(JobStatus.PENDING, 0),
         "processing": counts.get(JobStatus.PROCESSING, 0),
