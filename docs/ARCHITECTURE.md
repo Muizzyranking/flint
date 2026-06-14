@@ -11,17 +11,17 @@
 4. [Data Flow](#data-flow)
 5. [Database Design](#database-design)
 6. [Heap-Based Priority Queue](#heap-based-priority-queue)
-7. [Timing Wheel — Alternative Algorithm](#timing-wheel--alternative-algorithm)
-8. [Algorithm Tradeoffs & Benchmark](#algorithm-tradeoffs--benchmark)
-9. [DAG Workflow Engine](#dag-workflow-engine)
-10. [Worker Architecture](#worker-architecture)
-11. [Retry & Backoff System](#retry--backoff-system)
-12. [Dead Letter Queue](#dead-letter-queue)
-13. [Starvation Prevention](#starvation-prevention)
-14. [Cancellation Design](#cancellation-design)
-15. [Duplicate Protection](#duplicate-protection)
-16. [Recurring Jobs](#recurring-jobs)
-17. [Live Updates — SSE](#live-updates--sse)
+7. [Algorithm Tradeoffs & Benchmark](#algorithm-tradeoffs--benchmark)
+8. [DAG Workflow Engine](#dag-workflow-engine)
+9. [Worker Architecture](#worker-architecture)
+10. [Retry & Backoff System](#retry--backoff-system)
+11. [Dead Letter Queue](#dead-letter-queue)
+12. [Starvation Prevention](#starvation-prevention)
+13. [Cancellation Design](#cancellation-design)
+14. [Duplicate Protection](#duplicate-protection)
+15. [Recurring Jobs](#recurring-jobs)
+16. [Live Updates — SSE](#live-updates--sse)
+17. [Worker Registry](#worker-registry)
 18. [Logging Architecture](#logging-architecture)
 19. [Security](#security)
 20. [Infrastructure Overview](#infrastructure-overview)
@@ -30,84 +30,90 @@
 
 ## System Overview
 
-Flint is a background job scheduling system. It accepts jobs from a REST API, queues them by priority and schedule, processes them through independent workers, and tracks every state transition. It is built to handle failure — retries, dead letters, and alerting are first-class concerns, not afterthoughts.
+Flint is a background job scheduling system. It accepts jobs from a REST API, queues them by priority and schedule, processes them through an in-memory heap, and tracks every state transition. It is built to handle failure — retries, dead letters, and alerting are first-class concerns, not afterthoughts.
 
-Flint is composed of four independently running processes that share a PostgreSQL database and a Redis instance:
+Flint is split across two hosting environments:
 
-- **API server** — accepts and exposes job data over HTTP
-- **Worker processes** — poll the queue and execute jobs
-- **Scheduler process** — watches for due jobs and manages recurring execution and priority aging
-- **Frontend** — Next.js dashboard that reflects system state in real-time
+**EC2 instance (backend)** — runs the API server and worker process. The frontend is not hosted here to avoid exhausting the EC2 free tier storage limit.
+
+- **API server** — accepts and exposes job data over HTTP. Writes to PostgreSQL only. Never touches the queue.
+- **Worker process** — owns the HeapQueue. Runs the scheduler, aging, and worker coroutines together as async tasks inside a single process.
+
+**Vercel (frontend)** — the Next.js dashboard is deployed to Vercel. It communicates with the API server over HTTPS and connects to the SSE stream directly from the browser.
+
+**Nginx** runs on the EC2 host directly (not inside Docker) as a reverse proxy, routing HTTPS traffic into the Dockerised API and worker containers.
+
+Redis is used exclusively for two things: SSE pub/sub (job status events to the browser) and the worker heartbeat/control system. Redis is never used as a job queue.
+
+Email is handled by a **Mailhog server** running as a Docker container, acting as the SMTP mock for the `send_email` job handler and DLQ alert emails.
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Client (Browser)                           │
-│                     Next.js — flint.muizzyranking.com               │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │ HTTPS
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                            Nginx                                    │
-│                     Reverse Proxy + SSL                             │
-  api.flint.muizzyranking.com → :8000    flint.muizzyranking.com → :3000    │
-└────────────────┬──────────────────────────────────┬─────────────────┘
-                 │                                  │
-                 ▼                                  ▼
-┌───────────────────────────┐          ┌────────────────────────────┐
-│       FastAPI App         │          │       Next.js App          │
-│       Port :8000          │          │       Port :3000           │
-│                           │          │                            │
-│  REST API (versioned)     │          │  Dashboard                 │
-│  SSE Stream               │          │  Jobs Table                │
-│  Swagger Docs             │          │  Create Job Form           │
-│  Auth (API Key)           │          │  DLQ View                  │
-└──────────┬────────────────┘          │  Settings Panel            │
-           │                           │  Bin / Restore             │
-           │                           │  Logs Viewer               │
-           │                           │  Benchmark View            │
-           │                           └────────────────────────────┘
-           │
-    ┌──────┴──────────────────────────────────────┐
-    │                                             │
-    ▼                                             ▼
-┌────────────────┐                    ┌───────────────────────┐
-│  PostgreSQL    │                    │        Redis          │
-│  Primary Store │                    │  Priority Queue       │
-│                │                    │  Pub/Sub (SSE)        │
-│  jobs          │                    │  Worker Registry      │
-│  job_deps      │◄───────────────────│  Strategy Config      │
-│  job_logs      │                    └───────────────────────┘
-│  settings      │                              ▲
-└────────┬───────┘                              │
-         │                                      │
-         │         ┌────────────────────────────┘
-         │         │
-         ▼         ▼
-┌──────────────────────────────────────────────────────────┐
-│                     Worker Processes                     │
-│                                                          │
-│   Worker-1                       Worker-2                │
-│   ┌─────────────────┐            ┌─────────────────┐    │
-│   │ Poll Queue      │            │ Poll Queue      │    │
-│   │ Claim Job (DB)  │            │ Claim Job (DB)  │    │
-│   │ Execute Handler │            │ Execute Handler │    │
-│   │ Update Status   │            │ Update Status   │    │
-│   │ Publish Event   │            │ Publish Event   │    │
-│   └─────────────────┘            └─────────────────┘    │
-└──────────────────────────────────────────────────────────┘
-         ▲
-         │
-┌────────┴──────────────┐
-│   Scheduler Process   │
-│                       │
-│  Due Job Loop         │  ← pushes scheduled jobs to queue when due
-│  Aging Loop           │  ← decrements effective_priority on old jobs
-│  Recurrence Handler   │  ← creates next run for recurring jobs
-└───────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Client (Browser)                             │
+└──────────────┬──────────────────────────────────────┬───────────────┘
+               │ HTTPS (API + SSE)                    │ HTTPS (UI)
+               ▼                                      ▼
+┌──────────────────────────────┐       ┌──────────────────────────────┐
+│  EC2 Instance (Ubuntu 24)    │       │  Vercel                      │
+│                              │       │                              │
+│  ┌────────────────────────┐  │       │  Next.js Dashboard           │
+│  │  Nginx  (on host)      │  │       │  app.yourdomain.com          │
+│  │  Reverse proxy + SSL   │  │       │                              │
+│  │  api.yourdomain.com    │  │       │  Dashboard / Jobs / DLQ      │
+│  │  → Docker :8000        │  │       │  Settings / Logs / Benchmark │
+│  └───────────┬────────────┘  │       └──────────────────────────────┘
+│              │               │
+│   Docker Compose             │
+│   ┌──────────▼────────────┐  │
+│   │    FastAPI App        │  │
+│   │    Port :8000         │  │
+│   │                       │  │
+│   │  REST API (versioned) │  │
+│   │  SSE Stream           │  │
+│   │  Swagger Docs         │  │
+│   │  Auth (API Key)       │  │
+│   └──────────┬────────────┘  │
+│              │               │
+│   ┌──────────▼────────────┐  │   ┌────────────────────────────┐
+│   │     PostgreSQL        │  │   │          Redis             │
+│   │     Port :5432        │  │   │      Port :6379            │
+│   │                       │  │   │                            │
+│   │  jobs                 │  │   │  SSE pub/sub               │
+│   │  job_dependencies     │  │   │  flint:events channel      │
+│   │  job_logs             │  │   │                            │
+│   │  settings             │  │   │  Worker heartbeats         │
+│   └──────────┬────────────┘  │   │  flint:workers:<id>        │
+│              │               │   │                            │
+│   ┌──────────▼────────────┐  │   │  Control channels          │
+│   │   Worker Process      ├──┼───┤  flint:worker:control:<id> │
+│   │   (python -m          │  │   └────────────────────────────┘
+│   │    worker.main)       │  │
+│   │                       │  │
+│   │  ┌─────────────────┐  │  │
+│   │  │   HeapQueue     │  │  │
+│   │  │  (shared in     │  │  │
+│   │  │   memory)       │  │  │
+│   │  └──┬──────────┬───┘  │  │
+│   │     │push()    │pop() │  │
+│   │  ┌──▼──────┐ ┌▼────┐  │  │
+│   │  │Scheduler│ │Wrkr1│  │  │
+│   │  │  task   │ │Wrkr2│  │  │
+│   │  └─────────┘ └─────┘  │  │
+│   │  ┌──────────────────┐  │  │
+│   │  │   Aging task     │  │  │
+│   │  └──────────────────┘  │  │
+│   └───────────────────────┘  │
+│                              │
+│   ┌───────────────────────┐  │
+│   │       Mailhog         │  │
+│   │  SMTP :1025           │  │
+│   │  Web UI :8025         │  │
+│   └───────────────────────┘  │
+└──────────────────────────────┘
 ```
 
 ---
@@ -119,57 +125,53 @@ Flint is composed of four independently running processes that share a PostgreSQ
 The API server is the entry point for all external interaction. It is responsible for:
 
 - Receiving job creation requests and writing them to PostgreSQL
-- Exposing job status, logs, DLQ, and settings over REST
+- Exposing job status, logs, DLQ, settings, and worker state over REST
 - Streaming real-time job events to connected clients via SSE
 - Authenticating all requests via API key
 - Providing Swagger documentation at `/api/v1/docs`
 
-The API server does **not** process jobs. It writes jobs to the database and returns. All execution happens asynchronously in the worker processes.
+The API server does **not** process jobs and does **not** interact with the HeapQueue. It writes jobs to PostgreSQL and returns. The worker process picks them up independently.
 
-### Worker Processes
+### Worker Process
 
-Workers run independently. They share no memory with the API server — their only communication channel is the PostgreSQL database and Redis queue.
+A single process (`python -m worker.main`) that owns the HeapQueue and runs all execution-related async tasks together:
 
-Each worker:
-- Polls the active queue (heap or timing wheel, based on current `scheduler_strategy` setting) for the next job
-- Atomically claims the job in PostgreSQL
-- Executes the appropriate handler
-- Checks a cooperative cancellation flag at key checkpoints
-- Updates job status and publishes an SSE event on completion or failure
-- Handles retries and DLQ transitions
+- **Scheduler task** — polls PostgreSQL every second for due pending jobs, pushes them into the HeapQueue
+- **Worker-1 task** — pops from the HeapQueue, claims jobs in PostgreSQL, executes handlers
+- **Worker-2 task** — same as Worker-1, operating concurrently on the same shared queue
+- **Aging task** — every 30 seconds, decrements `effective_priority` on long-waiting jobs and updates their scores in the heap
+- **WorkerRegistry** — maintains heartbeat keys in Redis so the API can list and control workers
 
-Two workers run by default. They operate independently and cannot pick up the same job due to the atomic claim mechanism.
+The number of worker coroutines is controlled by the `WORKER_COUNT` environment variable (default: 2).
 
-### Scheduler Process
+### HeapQueue — The Real Queue
 
-The scheduler is a single long-running process with two internal loops:
+The `HeapQueue` is the authoritative job dispatcher. It is an in-memory min-heap that lives inside the worker process. The scheduler pushes job IDs into it; worker coroutines pop from it. There is no Redis sorted set, no Celery broker, no external queue — the heap is the queue.
 
-**Due Job Loop** — runs every second. Queries PostgreSQL for `pending` jobs where `scheduled_at <= NOW()` and whose `worker_id IS NULL`. Pushes eligible jobs onto the active Redis queue. This is how both future-scheduled and immediate jobs enter the execution pipeline.
-
-**Aging Loop** — runs every 30 seconds. Finds jobs that have been waiting longer than their priority threshold and decrements their `effective_priority`. This prevents low-priority jobs from waiting indefinitely.
+The `asyncio.Lock` inside `HeapQueue` ensures concurrent `pop()` calls from multiple worker coroutines are safe. The PostgreSQL atomic claim is the secondary safety net.
 
 ### PostgreSQL
 
-The primary source of truth. All job state lives here. Redis is a cache and coordination layer — PostgreSQL is what is trusted.
+The primary source of truth. All job state lives here permanently. Key design decisions:
 
-Key design decisions:
 - UUID primary keys throughout for safe distributed generation
 - Soft delete via `deleted_at` — data is never lost by default
 - `effective_priority` stored as a float column so the aging process can update it in-place
-- `cancellation_requested` flag on the jobs table for cooperative cancellation
+- `cancellation_requested` flag for cooperative cancellation
 - `worker_id` on the jobs table acts as an optimistic lock for duplicate protection
 
 ### Redis
 
-Redis serves three purposes:
+Redis serves exactly two purposes in Flint:
 
-1. **Priority queue backing store** — a sorted set (`flint:queue`) stores job IDs scored by `effective_priority`. Workers pop from this set to know which job to claim next.
-2. **Pub/Sub channel** — the `flint:events` channel carries job status change events to the SSE endpoint, which forwards them to connected browser clients.
-3. **Worker registry** — each worker writes a heartbeat key (`flint:worker:<id>`) with a TTL. The API reads these keys to report active workers.
+1. **SSE pub/sub** — the `flint:events` channel carries job status change events from the worker process to the FastAPI SSE endpoint, which forwards them to browser clients
+2. **Worker registry** — each worker coroutine writes a heartbeat key (`flint:worker:<id>`) with a 60-second TTL. The API reads these keys to list active workers. Control commands (stop/restart) are published to per-worker channels (`flint:worker:control:<id>`)
+
+Redis is **not** used as a job queue. No sorted sets, no `ZADD`, no `ZPOPMIN`.
 
 ### Mailhog
 
-A local SMTP server that catches all outgoing email. Used as the mock external email service for the `send_email` job handler and for DLQ alert emails. Its web UI (port 8025) allows inspecting delivered emails during development.
+A local SMTP server that catches all outgoing email. Used for the `send_email` job handler and for DLQ alert emails. Its web UI (port 8025) lets you inspect delivered emails during development.
 
 ---
 
@@ -186,24 +188,26 @@ Job written to PostgreSQL (status: pending, scheduled_at set)
     ↓
 If dependency_ids provided → rows inserted into job_dependencies
     ↓
-Job is NOT pushed to queue yet
+SSE event published to Redis: {"job_id": "...", "status": "pending"}
     ↓
-Scheduler's due-job loop picks it up when scheduled_at <= NOW()
-  AND all dependencies are completed (or no dependencies exist)
+API returns 201 — job is now in PostgreSQL, not yet in the heap
     ↓
-Job pushed to Redis sorted set (flint:queue)
+Scheduler task (in worker process) polls PostgreSQL every second
     ↓
-Worker pops job_id from Redis
+When scheduled_at <= NOW and all dependencies completed:
+    → queue.push(job_id, effective_priority, scheduled_at, created_at)
+    ↓
+Worker coroutine calls queue.pop()
+    → receives job_id from the heap (lowest score = most urgent)
     ↓
 Worker atomically claims job in PostgreSQL
+    (UPDATE WHERE status='pending' AND worker_id IS NULL)
     ↓
-Handler executes
+Handler executes (webhook / email / log_processing)
     ↓
-Status updated → event published to Redis pub/sub
+Status updated in PostgreSQL
     ↓
-SSE endpoint broadcasts to connected browser clients
-    ↓
-Frontend updates without page refresh
+SSE event published to Redis → browser receives live update
 ```
 
 ### Retry Flow
@@ -211,39 +215,41 @@ Frontend updates without page refresh
 ```
 Handler raises exception
     ↓
-Worker increments retry_count
+processor.handle_failure() called
     ↓
 retry_count < max_retries?
-  YES → calculate backoff delay with jitter
-        set status = pending, next_retry_at = now + delay
-        job re-enters queue after delay
-  NO  → send to DLQ (status = failed, is_dlq = true)
-        check DLQ count against threshold
-        if count >= threshold → fire alert email
+  YES → set status='pending', next_retry_at=now+delay
+        asyncio.create_task(_requeue_after_delay())
+          → sleep(delay)
+          → queue.push(job_id, ...)   ← pushed back into the heap
+  NO  → send_to_dlq()
+          set status='failed', is_dlq=True
+          check threshold → fire alert email if needed
 ```
 
 ### DAG Flow
 
 ```
-Job C depends on Job B which depends on Job A
+Job C depends on B, B depends on A.
 
-Job A created → status: pending (in queue)
-Job B created → status: pending (NOT in queue, waiting on A)
-Job C created → status: pending (NOT in queue, waiting on B)
+Scheduler polls PostgreSQL:
+  - Job A: no deps, due now → queue.push(A)
+  - Job B: dep on A not completed → skip
+  - Job C: dep on B not completed → skip
 
-Job A completes
+Worker pops A → executes → marks completed
     ↓
-DAG service checks: who depends on A?
-    → Job B. Are all of B's dependencies complete? Yes.
-    → Push Job B onto queue
-
-Job B completes
+dag_service.on_job_completed(A) called
+    → checks who depends on A → finds B
+    → all B's deps completed? YES
+    → queue.push(B)
     ↓
-DAG service checks: who depends on B?
-    → Job C. Are all of C's dependencies complete? Yes.
-    → Push Job C onto queue
-
-Job C completes → DAG workflow done
+Worker pops B → executes → marks completed
+    ↓
+dag_service.on_job_completed(B) called
+    → finds C, all deps met → queue.push(C)
+    ↓
+Worker pops C → executes → done
 ```
 
 ---
@@ -253,29 +259,26 @@ Job C completes → DAG workflow done
 ### Entity Relationships
 
 ```
-jobs (1) ──────────────────── (many) job_dependencies
-  job_id = jobs.id (the waiting job)
-  depends_on_id = jobs.id (the prerequisite job)
+jobs (1) ──── (many) job_dependencies
+  job_id        → the waiting job
+  depends_on_id → the prerequisite job
 
-jobs (1) ──────────────────── (many) job_logs
-  job_id = jobs.id
+jobs (1) ──── (many) job_logs
+  job_id → jobs.id
 
-settings (standalone key-value store)
+settings → standalone key-value store
 ```
 
 ### Key Design Decisions
 
-**Why `effective_priority` as a separate column from `priority`?**
-The raw `priority` (1, 2, 3) is the user-assigned value. `effective_priority` is the scheduler's working value — it starts equal to `priority` and is decremented by the aging process. Keeping them separate means that the original priority can always be reported while the scheduler works with the aged value internally.
+**`effective_priority` vs `priority`**
+The raw `priority` (1, 2, 3) is the user-assigned value and never changes. `effective_priority` starts equal to `priority` and is decremented by the aging process over time. Keeping them separate means the user always sees the original priority while the scheduler works with the aged value.
 
-**Why soft delete?**
-Job history is valuable. Soft delete lets the system maintain a bin with restore capability while keeping normal queries clean via `WHERE deleted_at IS NULL`.
+**Why JSONB for `payload`**
+Job payloads are handler-specific and vary in structure. JSONB gives full flexibility without requiring a schema change for each new handler type.
 
-**Why JSONB for `payload`?**
-Job payloads are handler-specific and vary in structure. JSONB gives full flexibility without requiring a schema change for each new handler type. PostgreSQL's JSONB indexing also allows future querying on payload fields if needed.
-
-**Why store `interval_seconds` as a bigint?**
-Recurring intervals are stored in seconds regardless of how they were expressed (minutes, hours, days, etc). This eliminates parsing on every recurrence calculation. The conversion happens once at job creation.
+**Why store `interval_seconds` as bigint**
+Recurring intervals are stored in seconds regardless of how they were expressed. The conversion from human-readable format (5m, 1h, 1d) happens once at job creation. Recurrence math is then a simple integer addition.
 
 ---
 
@@ -283,114 +286,68 @@ Recurring intervals are stored in seconds regardless of how they were expressed 
 
 ### What a Min-Heap Is
 
-A min-heap is a complete binary tree where every parent node has a value less than or equal to its children. In Python's `heapq` module, this is implemented as a list where for any element at index `i`, its children are at indices `2i+1` and `2i+2`.
-
-The invariant means the smallest element is always at index 0 — accessible in O(1). Inserting a new element or removing the minimum takes O(log n) due to the "sift" operation that restores the heap invariant.
+A min-heap is a complete binary tree where every parent node has a value less than or equal to its children. Python's `heapq` implements this as a list where for element at index `i`, children are at `2i+1` and `2i+2`. The smallest element is always at index 0 — accessible in O(1). Insert and remove-min take O(log n).
 
 ### How Flint Uses the Heap
 
-Flint's heap stores entries as tuples:
+Each job in the heap is a tuple:
 
 ```
 (effective_priority, scheduled_at, created_at, job_id)
 ```
 
-Python compares tuples lexicographically left-to-right. So `heappop` always returns the entry with:
-1. The lowest `effective_priority` (most urgent by priority)
-2. Ties broken by earliest `scheduled_at` (longest waiting job wins)
-3. Ties broken by earliest `created_at` (oldest job wins)
-4. Ties broken by `job_id` (deterministic, not meaningful)
+Python compares tuples lexicographically left-to-right, so `heappop` always returns the entry with:
+1. Lowest `effective_priority` (most urgent by priority score)
+2. Earliest `scheduled_at` (breaks ties — job scheduled sooner wins)
+3. Earliest `created_at` (breaks ties — older job wins)
+4. Lexicographically smallest `job_id` (deterministic final tiebreaker)
 
-### Mutable Priorities — Lazy Deletion
+### Lazy Deletion for Re-scoring
 
-The heap does not support O(1) removal or re-keying of arbitrary elements. When the aging process lowers a job's `effective_priority`, or when a job is cancelled, we cannot efficiently find and update its position in the heap.
+The heap does not support O(1) removal of arbitrary elements. When the aging process lowers a job's `effective_priority`, Flint uses the **lazy deletion pattern**:
 
-Flint uses the **lazy deletion pattern**:
-- When a job needs to be removed or re-scored, its heap entry is marked as `__removed__` in place
-- A new entry with the updated score is pushed onto the heap
-- On `pop`, entries marked `__removed__` are silently discarded until a valid entry is found
+- The old entry is marked `__removed__` in-place (O(1))
+- A new entry with the updated score is pushed (O(log n))
+- On `pop()`, entries marked `__removed__` are silently discarded
 
-This means the heap may temporarily contain stale entries, but correctness is maintained because valid entries always shadow stale ones.
+This avoids rebuilding the heap and keeps re-scoring at O(log n).
 
-### Redis Sorted Set as Persistent Backing
+### Why There Is No Redis Sorted Set
 
-The in-memory heap is ephemeral — it is rebuilt when a worker process restarts. The Redis sorted set (`flint:queue`) acts as the persistent queue. When a worker starts, it loads pending job IDs from Redis and reconstructs its local heap.
+A Redis sorted set also provides O(log n) insert and pop. However, using Redis as the queue creates a fundamental mismatch: the heap's sort key is a 4-tuple `(effective_priority, scheduled_at, created_at, job_id)` but Redis only stores a single float score. This means:
 
-The Redis sorted set uses `effective_priority` as the score. `ZADD` for insert is O(log n). `ZRANGE ... LIMIT 1` for peek is O(log n). `ZREM` for consume is O(log n). This is consistent with heap performance.
+- `scheduled_at` and `created_at` tie-breaking is lost
+- Aging re-scores would require updating Redis scores separately from the heap
+- The queue would be split across two systems with no single owner
 
----
+By keeping the heap entirely in-process, Flint has one source of truth for job ordering. The scheduler pushes into it; workers pop from it; the aging process updates it. No synchronisation overhead, no split-brain risk.
 
-## Timing Wheel — Alternative Algorithm
+### Shared Queue, Multiple Workers
 
-### What a Timing Wheel Is
+The `HeapQueue` is instantiated once in `worker/main.py` and passed to all worker coroutines as a shared reference. The `asyncio.Lock` inside `HeapQueue` serialises concurrent `pop()` calls — only one worker can pop at a time, eliminating the possibility of two workers receiving the same job ID from the heap.
 
-A timing wheel is a circular array of time slots. Each slot holds a list of jobs due at that time. A pointer advances by one slot every tick (e.g. every second). Jobs in the current slot are executed, and the pointer moves on.
-
-```
-Slot 0  [job_A, job_B]
-Slot 1  []
-Slot 2  [job_C]
-Slot 3  []
-...
-Slot 3599 [job_Z]
-   ↑
-current pointer (advances 1 slot per second)
-```
-
-When the pointer advances past slot 3599 it wraps back to slot 0 — hence "wheel".
-
-### Flint's Timing Wheel Design
-
-- **Wheel size:** 3600 slots (1 hour of second-resolution coverage)
-- **Tick interval:** 1 second
-- **Overflow:** Jobs scheduled more than 3600 seconds in the future are held in an overflow dictionary keyed by `scheduled_at` timestamp. Each tick, the scheduler checks if any overflow jobs have come within the wheel's range and inserts them.
-- **Priority within a slot:** Jobs in the same slot are sorted by `effective_priority`. The timing wheel does not natively support cross-slot priority ordering — it is purely time-ordered at the slot level.
-
-### Why This Is the Right Alternative
-
-The timing wheel is architecturally different from the heap. The heap prioritises by urgency score; the timing wheel prioritises by time. They excel at different things. Benchmarking them against each other reveals a genuine tradeoff, not just an implementation difference.
+The PostgreSQL atomic claim is a second safety net for cases where the lock could theoretically be bypassed (e.g. after a retry re-queues a job that is briefly visible to both workers).
 
 ---
 
 ## Algorithm Tradeoffs & Benchmark
 
-### Theoretical Comparison
+Flint includes a `TimingWheel` implementation alongside the `HeapQueue` for benchmarking and comparison purposes. The timing wheel is **not used in job dispatch** — it exists to demonstrate the algorithmic tradeoff and satisfy the spec requirement of implementing and benchmarking an alternative scheduling algorithm.
+
+See `BENCHMARK.md` for full results, methodology, and analysis.
+
+### Summary
 
 | Property | Heap | Timing Wheel |
 |---|---|---|
 | Insert | O(log n) | O(1) |
-| Pop next job | O(log n) | O(1) amortized |
-| Re-score (aging) | O(log n) | O(n) worst case |
+| Pop next | O(log n) | O(1) amortised |
+| Re-score (aging) | O(log n) via lazy deletion | O(W) scan |
 | Priority ordering | Exact, global | Per-slot only |
-| Far-future scheduling | Natural | Requires overflow dict |
-| Memory | O(n) | O(W + n), W = wheel size |
-| Starvation prevention | Natural via score | Requires explicit priority sort per slot |
-| Best workload | Priority-heavy, mixed scheduling | High-volume, time-based, similar priorities |
+| Far-future jobs | Natural | Requires overflow dict |
+| Why Flint uses it | Priority + aging are first-class | High-volume time-based only |
 
-### Expected Benchmark Results
-
-At `n = 10,000` jobs with random priorities and scheduled times:
-
-The timing wheel is expected to win on raw insert and pop throughput because O(1) insert vs O(log n) is a real difference at scale. At n=10,000, log(10,000) ≈ 13. At n=1,000,000, log(1,000,000) ≈ 20. The gap widens at scale.
-
-However, when re-scoring is frequent (as it is in Flint due to aging), the timing wheel's O(n) worst-case removal cost erodes its throughput advantage. The heap's lazy deletion pattern handles re-scoring efficiently.
-
-**Conclusion:** The heap is the correct primary algorithm for Flint because priority ordering and re-scoring are first-class requirements. The timing wheel would win in a pure time-based scheduling workload with uniform priorities.
-
-### Running the Benchmark
-
-```bash
-# Run the benchmark script directly
-python -m benchmark.runner --n 10000
-
-# Or via the API endpoint
-POST /api/v1/benchmark/run
-{ "n": 10000, "algorithm": "both" }
-```
-
-### Switching Algorithms at Runtime
-
-The active scheduling algorithm is stored in the `settings` table under the key `scheduler_strategy`. Workers and the scheduler read this setting on every poll cycle. Switching from `heap` to `timing_wheel` (or back) via `PATCH /api/v1/settings` takes effect on the next poll cycle — no restart required. Jobs currently in the queue remain there; the new strategy governs job selection going forward.
+The heap is the correct choice for Flint because priority ordering and re-scoring (starvation prevention) are first-class requirements. The timing wheel would win on raw throughput in a system with uniform priorities and no aging.
 
 ---
 
@@ -398,7 +355,7 @@ The active scheduling algorithm is stored in the `settings` table under the key 
 
 ### What a DAG Is
 
-A Directed Acyclic Graph (DAG) is a graph where edges have direction and there are no cycles. In Flint, nodes are jobs and edges are dependencies. "Job B depends on Job A" means there is a directed edge from A to B. Acyclic means you cannot have A depend on B while B depends on A — directly or transitively.
+A Directed Acyclic Graph (DAG) where nodes are jobs and edges are dependencies. "Job B depends on Job A" means there is a directed edge A→B. Acyclic means no job can depend on itself directly or transitively.
 
 ### How Flint Implements It
 
@@ -409,87 +366,65 @@ job_id        → the job that is waiting
 depends_on_id → the job that must complete first
 ```
 
-A job with dependencies is created with `status = pending` but is **not pushed to the queue**. It becomes eligible for the queue only when all its `depends_on_id` jobs have `status = completed`.
+A job with dependencies is created with `status = pending` but the **scheduler skips it** until all its dependencies have `status = completed`. The scheduler checks unmet dependencies on every poll cycle using a COUNT query.
 
-After every job completion, the DAG service:
-1. Queries for all jobs that list the completed job as a dependency
-2. For each dependent, counts how many of its total dependencies are now `completed`
-3. If the count equals the total dependency count, the job is unblocked and pushed to the queue
+After every job completion, `dag_service.on_job_completed()` finds all jobs that depended on it, checks if their remaining dependencies are met, and pushes newly unblocked jobs into the heap.
 
-### Cascade Failure
+### Cascade Failure and Cascade Retry
 
-When a job fails permanently (exhausts retries, goes to DLQ):
-- All jobs that depend on it (directly or transitively) are marked `cancelled`
-- The cancellation reason is recorded: `"Cancelled: dependency job <id> failed permanently"`
-- The cascade recurses through the full downstream graph
+When a job fails permanently (goes to DLQ), `dag_service.on_job_failed()` BFS-traverses the downstream graph and marks all dependent pending jobs as `cancelled` with a clear reason message.
 
-### Cascade Retry (Option A)
-
-When a DLQ job that has downstream dependents is manually retried:
-- The job is reset to `pending` with `retry_count = 0`
-- All downstream `cancelled` jobs whose `last_error` contains `"dependency"` are also reset to `pending`
-- The cascade recurses through the full downstream graph
-- Once the retried root job completes, the normal DAG unblocking flow resumes
-
-This means retrying a root job automatically re-arms the entire workflow without manual intervention on each dependent job.
+When an engineer manually retries a DLQ job, `dag_service.on_dag_root_retried()` BFS-traverses the same graph and resets all auto-cancelled downstream jobs back to `pending`. Once the retried root job completes, the normal DAG unblocking flow resumes automatically.
 
 ### Cycle Prevention
 
-The API validates at job creation time that adding the specified `dependency_ids` would not create a cycle. This is done via a depth-first search from each proposed dependency back through its own dependencies, checking if the new job's ID would be encountered.
+At job creation, `dag_service.check_cycle()` performs a DFS from each proposed dependency through its own upstream dependencies. If the new job's ID is encountered, a `DependencyCycleException` is raised before any rows are inserted.
 
 ---
 
 ## Worker Architecture
 
-### Independence
+### Single Process, Multiple Coroutines
 
-Workers share no memory with the API server or with each other. They communicate exclusively through:
-- **PostgreSQL** — reading job state, writing status updates
-- **Redis** — reading from the priority queue, publishing SSE events, writing heartbeats
+All execution logic runs in one process started with `python -m worker.main`. Inside this process, `asyncio.gather()` runs the following concurrent tasks:
 
-This means workers can be scaled, restarted, or replaced without affecting the API server.
+- One scheduler task
+- One aging task
+- N worker coroutines (default 2, controlled by `WORKER_COUNT`)
 
-### Poll Loop
+Because these are all async tasks sharing one event loop, they can share the `HeapQueue` instance directly in memory with no IPC, no serialisation, and no network round-trips.
 
-Each worker runs a tight async loop:
+### Worker Lifecycle
 
 ```
-while running:
-    job_id = pop from Redis queue
-    if job_id is None:
-        sleep(WORKER_POLL_INTERVAL)
-        continue
-
-    claimed = atomic_claim(job_id)
-    if not claimed:
-        continue    ← another worker got it
-
-    check cancellation flag
+worker/main.py starts
+    ↓
+Creates HeapQueue, WorkerRegistry
+    ↓
+Scheduler task: initial sweep pushes all due pending jobs
+    ↓
+Worker coroutines start, register in Redis via WorkerRegistry
+    ↓
+Worker loop:
+    job_id = await queue.pop()      ← from HeapQueue
+    registry.set_busy(worker_id)
+    claimed = await claim_in_db()   ← atomic PostgreSQL UPDATE
+    if not claimed: continue        ← another coroutine got it
     execute handler
-    update status
-    publish SSE event
-    handle recurrence if applicable
+    update status in PostgreSQL
+    publish SSE event via Redis
+    registry.set_idle(worker_id)
+    ↓
+On SIGTERM/SIGINT:
+    shutdown_event.set()
+    all tasks exit their loops cleanly
+    WorkerRegistry deregisters all workers
+    process exits
 ```
 
 ### Graceful Shutdown
 
-Workers listen for `SIGTERM` and `SIGINT`. On receiving either:
-1. Stop accepting new jobs from the queue
-2. Allow the current job to complete or reach its next cancellation checkpoint
-3. Deregister from Redis worker registry
-4. Exit cleanly
-
-This ensures no job is left in `processing` state with no worker responsible for it.
-
-### Worker Registry
-
-Each worker writes a heartbeat to Redis every 30 seconds:
-
-```
-SET flint:worker:<worker_id> "active" EX 60
-```
-
-The key expires after 60 seconds. If a worker dies without deregistering, its key expires and the API's worker list reflects it as gone within 60 seconds. The scheduler has a cleanup process that resets any jobs with a `worker_id` pointing to a dead worker back to `pending`.
+Workers listen for `SIGTERM` and `SIGINT` via `asyncio`'s `add_signal_handler`. On receiving either signal, `shutdown_event` is set. All tasks check this event on each loop iteration and exit cleanly after finishing their current job. No job is left in `processing` state with no one responsible for it.
 
 ---
 
@@ -498,39 +433,36 @@ The key expires after 60 seconds. If a worker dies without deregistering, its ke
 ### Backoff Formula
 
 ```
-delay = 5^(attempt - 1) * random(0.5, 1.5)
+delay = 5^(attempt - 1) × uniform(0.5, 1.5)
 
-Attempt 1: 5^0 = 1  × jitter → ~0.5s to ~1.5s
-Attempt 2: 5^1 = 5  × jitter → ~2.5s to ~7.5s
-Attempt 3: 5^2 = 25 × jitter → ~12.5s to ~37.5s
+Attempt 1: base=1s  → range [0.5s,  1.5s]
+Attempt 2: base=5s  → range [2.5s,  7.5s]
+Attempt 3: base=25s → range [12.5s, 37.5s]
 ```
 
-The jitter multiplier (`random(0.5, 1.5)`) is "full jitter" — it prevents thundering herd problems where many failed jobs retry at exactly the same time and overload the downstream service.
+The jitter multiplier (`uniform(0.5, 1.5)`) is full jitter — it prevents thundering herd where many failed jobs all retry simultaneously and re-overwhelm the downstream service.
 
-### Why 3 Retries
+### Re-queuing After Retry
 
-Three retries covers the most common transient failure patterns (network blip, temporary service outage, rate limiting) without allowing a broken job to consume queue capacity indefinitely. After three attempts, the failure is considered systematic and moves to the DLQ for human inspection.
+After a failed job's state is updated in PostgreSQL, the processor creates a background async task:
 
-### Max Retries is Configurable Per Job
+```python
+asyncio.create_task(_requeue_after_delay(job, next_retry_at, delay))
+```
 
-The `max_retries` field on the job defaults to 3 but can be set per job at creation time. The retry logic always reads `job.max_retries`, not a hardcoded constant.
+This task sleeps for `delay` seconds then calls `queue.push()` to put the job back into the heap at the correct scheduled time. The scheduler's next poll would also pick it up, but the direct re-push is faster and more precise.
 
 ---
 
 ## Dead Letter Queue
 
-The DLQ is not a separate table. It is a view of the `jobs` table where `is_dlq = true`. This keeps the data model simple and means DLQ jobs retain their full history (all logs, retry counts, original payload).
+The DLQ is not a separate table. It is a view of the `jobs` table where `is_dlq = True`. Jobs retain their full history — all logs, retry counts, and original payload — when they move to the DLQ.
 
-### DLQ Threshold Alert
+### Threshold Alert
 
-The threshold is stored in `settings.dlq_threshold` (default: 5). After every DLQ insertion, the system counts all current DLQ jobs. If the count meets or exceeds the threshold, a Jinja-rendered HTML email is sent to all addresses in `settings.alert_emails`.
+The threshold is stored in `settings.dlq_threshold` (default: 5). After every DLQ insertion, the system counts current DLQ jobs. If count meets or exceeds the threshold, a branded HTML email is rendered via Jinja2 and sent to all addresses in `settings.alert_emails` via Mailhog.
 
-The alert email includes:
-- Current DLQ count and configured threshold
-- A table of the most recent 10 DLQ jobs: ID, type, error message, retry count, failure time
-- A direct link to the DLQ dashboard
-
-The threshold and recipient list are configurable at runtime via `PATCH /api/v1/settings` with no restart required.
+Both the threshold and recipient list are configurable at runtime via `PATCH /api/v1/settings` with no restart required.
 
 ---
 
@@ -538,25 +470,25 @@ The threshold and recipient list are configurable at runtime via `PATCH /api/v1/
 
 ### The Problem
 
-Without starvation prevention, a sustained flow of high-priority jobs (priority 1) can indefinitely block medium (priority 2) and low (priority 3) jobs from ever executing, even if those jobs have been waiting for hours.
+Without starvation prevention, a sustained flow of high-priority jobs can indefinitely block medium and low priority jobs from executing, even after hours of waiting.
 
-### Flint's Solution — Priority Aging
+### Aging Solution
 
-The aging process runs every 30 seconds. It decrements `effective_priority` for jobs that have been waiting past their threshold:
+The aging task runs every `AGING_INTERVAL` seconds (default 30s). It decrements `effective_priority` for jobs waiting past their threshold:
 
 ```
 Medium priority (2) waiting > 2 minutes:
-    effective_priority -= 0.1 per aging cycle
-    After ~10 cycles (~5 min): effective_priority reaches 1.0 (same as High)
+    effective_priority -= 0.1 per cycle
+    After 10 cycles (~5 min): reaches 1.0 → competes with High priority
 
 Low priority (3) waiting > 5 minutes:
-    effective_priority -= 0.1 per aging cycle
-    After ~20 cycles (~10 min total): effective_priority reaches 1.0
+    effective_priority -= 0.1 per cycle
+    After 20 cycles (~10 min total): reaches 1.0
 ```
 
-`effective_priority` is floored at 1.0 — a job can never exceed High priority, but it can reach it.
+`effective_priority` is floored at 1.0 — a job can never exceed High priority, but it can reach it. After updating the DB, the aging task calls `queue.update_priority()` on the heap for each affected job, using lazy deletion to re-score without rebuilding the heap.
 
-The heap uses `effective_priority` as its primary sort key. As a low-priority job ages, it rises in the heap and eventually gets picked up. Starvation is mathematically bounded — any job will reach `effective_priority = 1.0` within a predictable time window regardless of queue pressure.
+**Starvation is mathematically bounded**: any job will reach `effective_priority = 1.0` within a predictable time window regardless of queue pressure.
 
 ---
 
@@ -564,28 +496,25 @@ The heap uses `effective_priority` as its primary sort key. As a low-priority jo
 
 ### Pending Jobs
 
-A cancellation request on a `pending` job takes effect immediately. The job's status is set to `cancelled` and it is removed from the queue. If it has dependents, cascade cancellation propagates downstream.
+Immediate. The job status is set to `cancelled` in PostgreSQL. If it is in the heap, the scheduler's next `queue.contains()` check will skip it, and even if a worker pops it, the atomic claim will fail (status is no longer `pending`).
 
 ### Processing Jobs
 
-**Design decision:** Cooperative cancellation via a database flag.
+Cooperative cancellation via a database flag. When cancellation is requested on a processing job:
 
-When a cancellation is requested on a `processing` job:
-1. The API sets `cancellation_requested = true` on the job row
-2. The worker checks this flag at defined checkpoints within the handler
-3. On detecting `true`, the worker stops processing, performs any available cleanup, logs the event, and sets status to `cancelled`
+1. The API sets `cancellation_requested = True` on the job row
+2. The worker processor checks this flag at defined checkpoints: before execution, after execution, and inside long-running handlers at natural pause points
+3. On detecting `True`, the worker stops, logs the event, and sets status to `cancelled`
 
-**Documented behaviour:** *"A cancellation request on a processing job is honoured at the next checkpoint within the handler, not immediately. The job may continue executing its current atomic step before stopping. Side effects that have already occurred (e.g. an HTTP request that was already sent) cannot be rolled back."*
-
-### Why Cooperative Over Forceful
-
-Forceful termination (killing the process/thread) risks leaving external resources in inconsistent state — a webhook partially delivered, a file half-written, a database transaction uncommitted. Cooperative cancellation allows the handler to reach a safe stopping point before exiting.
+**Documented behaviour:** *A cancellation request on a processing job is honoured at the next checkpoint within the handler, not immediately. The job may complete its current atomic step before stopping. Side effects that have already occurred (e.g. an HTTP request that was already sent) cannot be rolled back.*
 
 ---
 
 ## Duplicate Protection
 
-Two workers polling simultaneously may both see the same job ID in the Redis queue. Flint prevents them from both processing it via an atomic SQL UPDATE:
+Two worker coroutines calling `queue.pop()` simultaneously cannot receive the same job ID because the `asyncio.Lock` inside `HeapQueue` serialises all pop operations.
+
+Even so, the atomic PostgreSQL claim is retained as a second safety net:
 
 ```sql
 UPDATE jobs
@@ -597,60 +526,107 @@ WHERE id = :job_id
 RETURNING id;
 ```
 
-PostgreSQL guarantees this UPDATE is atomic at the row level. If two workers execute this query for the same job simultaneously, exactly one will receive a row back. The other receives zero rows and discards the job. No explicit distributed locks, no Redis SETNX, no semaphores — the database atomicity is sufficient and correct.
+If two coroutines somehow attempt to claim the same job simultaneously, exactly one UPDATE succeeds. The other receives zero rows and discards the job. PostgreSQL row-level atomicity guarantees this without any application-level locks.
 
 ---
 
 ## Recurring Jobs
 
 When a recurring job completes:
-1. The worker reads `interval_seconds` from the completed job
-2. If non-null, it creates a new job with identical `type`, `payload`, `priority`, and `interval_seconds`
-3. The new job's `scheduled_at` is set to `NOW() + interval_seconds`
-4. The new job is written to PostgreSQL with `status = pending`
-5. The scheduler picks it up when its `scheduled_at` is due
 
-The original job is marked `completed` and retained in history. Each recurrence is a new job with a new UUID. This means the full history of recurring executions is preserved and queryable.
+1. The processor reads `interval_seconds` from the completed job
+2. Creates a new Job row with identical `type`, `payload`, `priority`, and `interval_seconds`
+3. Sets the new job's `scheduled_at = NOW() + interval_seconds`
+4. If the interval is very short and the next run is already due, pushes it directly into the heap
+5. Otherwise the scheduler picks it up on its next poll
+
+Each recurrence is a new job with a new UUID. The full history of recurring executions is preserved and queryable.
 
 ---
 
 ## Live Updates — SSE
 
-Server-Sent Events (SSE) is a one-way HTTP protocol where the server streams events to the client over a persistent connection. The client uses the browser-native `EventSource` API.
-
-### Why SSE Over WebSockets
-
-The UI only needs to receive updates from the server — it never needs to push data through the live channel. SSE is the correct tool for one-directional server-to-client streaming. WebSockets would add bidirectional overhead for no benefit.
+Server-Sent Events (SSE) is a one-way HTTP protocol where the server streams events to the client over a persistent connection. The client uses the browser-native `EventSource` API — no library needed.
 
 ### Event Flow
 
 ```
-Worker completes job
+Worker coroutine completes a job
     ↓
-Worker publishes to Redis: PUBLISH flint:events '{"job_id": "...", "status": "completed"}'
+_publish_sse({"job_id": "...", "status": "completed"})
+    → PUBLISH flint:events <json> via Redis
     ↓
-FastAPI SSE endpoint is subscribed to flint:events via Redis pub/sub
+FastAPI SSE endpoint subscribed to flint:events
     ↓
-Event forwarded to all connected EventSource clients as:
-data: {"job_id": "...", "status": "completed"}
+Event forwarded as:
+data: {"job_id": "...", "status": "completed"}\n\n
     ↓
-Frontend JavaScript updates the jobs table row in place
+Browser EventSource receives event
+    ↓
+Zustand store updates liveUpdates[job_id]
+    ↓
+Jobs table row re-renders with new status badge
 ```
 
-### Nginx SSE Configuration
+### Why SSE Over WebSockets
 
-Nginx buffers responses by default. SSE streams must have buffering disabled to reach the client in real-time:
+The UI only needs to receive updates from the server — it never pushes data through the live channel. SSE is the correct tool for one-directional streaming. WebSockets would add bidirectional overhead for no benefit.
+
+### Nginx Configuration for SSE
 
 ```nginx
 location /api/v1/sse/ {
     proxy_pass http://api:8000;
     proxy_buffering off;
     proxy_cache off;
+    proxy_read_timeout 3600s;
     proxy_set_header Connection '';
     proxy_http_version 1.1;
-    chunked_transfer_encoding on;
 }
 ```
+
+`proxy_buffering off` is critical — without it, Nginx holds the SSE stream in a buffer and events never reach the browser.
+
+---
+
+## Worker Heartbeat and Control
+
+Each worker coroutine manages its own Redis state directly — no separate registry class is used. The state and control logic lives inside `run_worker()` in `worker/worker.py`.
+
+### State Keys
+
+Each worker writes its status to `flint:workers:<worker_id>` as a plain string with a TTL:
+
+```
+flint:workers:worker-1  →  "idle"   (TTL: 60s)
+flint:workers:worker-1  →  "busy"   (TTL: 60s, set when job is picked up)
+flint:workers:worker-1  →  "active" (TTL: 60s, refreshed by heartbeat loop)
+```
+
+The key expires automatically if the process dies without deregistering — no stale state.
+
+### Heartbeat
+
+A `_heartbeat_loop` coroutine runs inside each worker task. It refreshes the Redis key every `HEARTBEAT_INTERVAL` seconds (not every second — the loop sleeps using `asyncio.wait_for` with a timeout):
+
+```python
+async def _heartbeat_loop():
+    while not local_stop.is_set() and not shutdown_event.is_set():
+        await redis.set(worker_key, "active", ex=WORKER_TTL)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(local_stop.wait()),
+                timeout=HEARTBEAT_INTERVAL
+            )
+        except TimeoutError:
+            pass
+```
+
+The worker also writes to the key on job state transitions (`"busy"` when picking up a job, `"idle"` when finishing) — these are event-driven updates, not part of the timed heartbeat.
+
+### Control Commands
+
+A `_control_loop` coroutine subscribes to `flint:worker:control:<worker_id>` via Redis pub/sub. The API publishes `"stop"` or `"restart"` to this channel. On receiving the command, the worker sets `local_stop` to trigger a clean exit from the poll loop.
 
 ---
 
@@ -673,11 +649,9 @@ All log output is structured JSON produced by `structlog`. Every log entry conta
 ### Outputs
 
 1. **stdout** — captured by Docker and available via `docker logs`
-2. **Rotating file** — written to `logs/flint.log`, rotated at 10MB, 5 backups retained
+2. **Rotating file** — `logs/flint.log`, rotated at 10MB, 5 backups retained
 
-### Log Viewer
-
-The API exposes `GET /api/v1/logs` which reads from the log file and returns paginated, filterable log entries. The frontend has a Logs page that displays these. This gives the visibility into system events without SSH access.
+Sensitive fields (`api_key`, `password`, `smtp_password`) are scrubbed by a structlog processor before any output is written.
 
 ---
 
@@ -685,93 +659,97 @@ The API exposes `GET /api/v1/logs` which reads from the log file and returns pag
 
 ### API Key Authentication
 
-All API endpoints require the `X-API-Key` header. The key is stored in the `.env` file and validated on every request via a FastAPI dependency. Invalid or missing keys return HTTP 401.
-
-The API key is a single shared secret suitable for a backend-to-backend or internal tool context. It is not a multi-tenant user authentication system.
+All API endpoints require the `X-API-Key` header. The key is stored in `.env` and validated on every request via a FastAPI dependency. Invalid or missing keys return HTTP 401. The SSE endpoint is the only exemption — browsers cannot set custom headers in `EventSource`.
 
 ### HTTPS
 
-All traffic is terminated at Nginx with a TLS certificate issued by Let's Encrypt via Certbot. HTTP traffic is redirected to HTTPS. The certificate auto-renews via a cron job.
-
-### No Credentials in Logs
-
-Structlog processors are configured to scrub sensitive fields (e.g. `api_key`, `password`, `smtp_password`) before writing log output.
+All traffic is terminated at Nginx with a TLS certificate issued by Let's Encrypt via Certbot. HTTP is redirected to HTTPS. The certificate auto-renews via a cron job.
 
 ---
 
 ## Infrastructure Overview
 
 ```
-VPS (Ubuntu 24 LTS)
+EC2 Instance (Ubuntu 24 LTS)
 │
-├── Nginx (port 80, 443)
+├── Nginx  (installed on host, not in Docker)
+│   ├── SSL termination via Certbot + Let's Encrypt
+│   ├── api.yourdomain.com → http://localhost:8000  (FastAPI)
+│   └── Proxy buffering disabled for SSE endpoint
 │
-├── Docker Engine
-│   └── Docker Compose
-│       ├── api            (port 8000, internal)
-│       ├── worker-1       (no port, internal)
-│       ├── worker-2       (no port, internal)
-│       ├── scheduler      (no port, internal)
-│       ├── postgres       (port 5432, internal)
-│       ├── redis          (port 6379, internal)
-│       └── mailhog        (port 8025, internal only)
+├── Docker Compose (backend services only)
+│   ├── api       (FastAPI,   port 8000 internal)
+│   ├── worker    (HeapQueue + scheduler + workers, no port)
+│   ├── postgres  (port 5432 internal)
+│   ├── redis     (port 6379 internal — SSE + heartbeats only)
+│   └── mailhog   (SMTP :1025 internal, Web UI :8025 internal)
 │
 ├── Certbot (Let's Encrypt SSL)
-│   └── cron: 0 0 * * * certbot renew --quiet
+│   └── cron: 0 3 * * * certbot renew --quiet
 │
 └── GitHub Actions CI/CD
     └── On push to main:
-        SSH into VPS
+        SSH into EC2
         git pull origin main
         docker compose up -d --build
+
+Vercel (separate, no EC2 involvement)
+└── Next.js frontend
+    └── app.yourdomain.com
+    └── Deployed via Vercel GitHub integration
 ```
 
-### Nginx Routing
+### Nginx on Host
+
+Nginx runs directly on the EC2 instance rather than inside Docker. This keeps the reverse proxy outside the container network, giving it direct access to SSL certificate files managed by Certbot on the host without volume mount complexity.
 
 ```nginx
-# api.flint.muizzyranking.com → FastAPI
+# /etc/nginx/sites-available/flint-api
+server {
+    listen 80;
+    server_name api.yourdomain.com;
+    return 301 https://$host$request_uri;
+}
+
 server {
     listen 443 ssl;
-    server_name api.flint.muizzyranking.com;
+    server_name api.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.yourdomain.com/privkey.pem;
 
     location / {
-        proxy_pass http://api:8000;
+        proxy_pass http://localhost:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # SSE: disable buffering so events reach the browser immediately
     location /api/v1/sse/ {
-        proxy_pass http://api:8000;
+        proxy_pass http://localhost:8000;
         proxy_buffering off;
         proxy_cache off;
         proxy_read_timeout 3600s;
-    }
-}
-
-# flint.muizzyranking.com → Next.js
-server {
-    listen 443 ssl;
-    server_name flint.muizzyranking.com;
-
-    location / {
-        proxy_pass http://frontend:3000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
     }
 }
 ```
 
-### Scaling
-
-To add more workers, add a new service to `docker-compose.yml`:
+### Docker Compose Services
 
 ```yaml
-worker-3:
+worker:
   build: .
-  command: python -m worker.worker
+  command: python -m worker.main
   env_file: .env
   environment:
-    WORKER_ID: worker-3
+    WORKER_COUNT: "2"      # increase to add more worker coroutines
 ```
 
-No configuration changes to the API, scheduler, or database are needed. Workers are stateless and the duplicate protection mechanism handles any number of concurrent workers correctly.
+To scale workers, increase `WORKER_COUNT`. No new containers needed — the single worker process spawns more async coroutines. All share the same HeapQueue instance in memory.
+
+### Frontend — Vercel
+
+The Next.js frontend is deployed to Vercel independently from the EC2 instance. The EC2 free tier does not have enough storage to comfortably host both the backend stack and a Next.js build. Vercel handles the frontend build, deployment, and global CDN distribution. The frontend connects to `api.yourdomain.com` for all API calls and SSE.
