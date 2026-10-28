@@ -1,10 +1,21 @@
+x-flint-environment: &flint-environment
+  APP_ENV: ${APP_ENV:-development}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD:-flint}@postgres:5432/${POSTGRES_DB:-flint}
+  REDIS_URL: redis://redis:6379/0
+  API_KEY: ${API_KEY:-dev-api-key}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  SMTP_HOST: ${SMTP_HOST:-mailhog}
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  SMTP_FROM: ${SMTP_FROM:-flint@flint.local}
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: flint-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-flint}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flint}
       POSTGRES_DB: ${POSTGRES_DB:-flint}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -27,44 +38,135 @@ services:
       retries: 5
     restart: unless-stopped
 
-  api:
+  # One-shot migration runner. API/worker wait for it to finish successfully.
+  migrate:
     build: .
-    container_name: flint-api
-    ports:
-      - "127.0.0.1:8000:8000"
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flint}
-      REDIS_URL: redis://redis:6379/0
+    container_name: flint-migrate
+    command: ["flint", "migrate"]
+    environment: *flint-environment
     depends_on:
       postgres:
         condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["flint", "api", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment: *flint-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   worker:
     build: .
-    command: uv run python -m worker.main
-    env_file: .env
+    command: ["flint", "worker"]
     environment:
-      WORKER_COUNT: 2
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flint}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flint}
-      REDIS_URL: redis://redis:6379/0
+      <<: *flint-environment
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
+      mailhog:
+        # Optional ordering only: when the mailhog profile is disabled the
+        # stack simply starts without an SMTP catcher.
+        condition: service_started
+        required: false
     volumes:
       - ./logs:/app/logs
+    # Clean exits are intentional (stop/restart control commands); crash loops
+    # are restarted. Scale with: docker compose up -d --scale worker=3
+    restart: on-failure
 
+  # Development SMTP catcher. Gated behind the `mailhog` profile so a
+  # deployment using a real SMTP relay does not start it at all
+  # (.env: drop `mailhog` from COMPOSE_PROFILES and set SMTP_HOST/SMTP_PORT).
+  # The worker's depends_on below is `required: false`, so the stack runs
+  # normally with the profile off.
   mailhog:
+    profiles: ["mailhog"]
     image: mailhog/mailhog
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"
     restart: unless-stopped
+
+  # Optional: the web frontend dashboard.
+  # Start with: docker compose --profile frontend up -d
+  frontend:
+    profiles: ["frontend"]
+    image: node:22-alpine
+    working_dir: /app
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      API_URL: http://api:8000/api/v1
+      API_KEY: ${API_KEY:-dev-api-key}
+      PORT: "3000"
+      FRONTEND_RELEASE_URL: ${FRONTEND_RELEASE_URL:-https://github.com/muizzyranking/flint-ui/releases/latest/download/flint-frontend.tar.gz}
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ -z "$$FRONTEND_RELEASE_URL" ]; then
+          echo "FRONTEND_RELEASE_URL is empty. Set it to a flint-ui release artifact URL." >&2
+          exit 1
+        fi
+        wget -q -O /tmp/site.tar.gz "$$FRONTEND_RELEASE_URL"
+        tar -xzf /tmp/site.tar.gz -C /app
+        exec node server.js
+
+  # Optional: live-clone the frontend repo (FRONTEND_REPO in .env) and run its
+  # dev server against the API. Start with: docker compose --profile frontend-dev up
+  frontend-dev:
+    profiles: ["frontend-dev"]
+    image: node:22-alpine
+    working_dir: /app
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      API_URL: http://api:8000/api/v1
+      API_KEY: ${API_KEY:-dev-api-key}
+      PORT: "3000"
+      FRONTEND_REPO: ${FRONTEND_REPO:-https://github.com/muizzyranking/flint-ui}
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ -z "$$FRONTEND_REPO" ]; then
+          echo "FRONTEND_REPO is not set. Add the frontend git repository URL to .env." >&2
+          exit 1
+        fi
+        apk add --no-cache git >/dev/null
+        corepack enable pnpm >/dev/null 2>&1 || npm i -g pnpm >/dev/null 2>&1
+        git clone --depth 1 "$$FRONTEND_REPO" /app
+        pnpm install
+        exec pnpm dev --host 0.0.0.0 --port 3000
 
 volumes:
   postgres_data:
