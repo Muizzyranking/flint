@@ -1,12 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Float, cast, func, select, update
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logger import get_logger
-from app.models.job import Job, JobPriority, JobStatus
-from app.queues.heapq import HeapQueue
+from app.models.enum import JobPriority, JobStatus
+from app.models.job import Job
 
 logger = get_logger(__name__)
 
@@ -14,13 +14,14 @@ _PRIORITY_FLOOR = 1.0
 
 
 class AgingProcess:
-    async def run(self, session: AsyncSession, queue: HeapQueue) -> dict:
-        """
-        One aging cycle:
-          1. Decrement effective_priority for qualifying medium + low jobs in DB
-          2. For each updated job, call queue.update_priority() on the heap
-          3. Log and return summary
-        """
+    """Prevent starvation by lowering the effective priority of waiting jobs.
+
+    Age is measured from ``available_at`` (when the job became eligible), not
+    ``created_at``. Otherwise a job scheduled a week in the future would age
+    before it could ever run.
+    """
+
+    async def run(self, session: AsyncSession) -> dict:
         now = datetime.now(UTC)
 
         medium_cutoff = now - timedelta(seconds=settings.MEDIUM_PRIORITY_AGE_THRESHOLD)
@@ -31,32 +32,29 @@ class AgingProcess:
 
         await session.commit()
 
-        # Sync updated priorities into the heap
-        if medium_count > 0 or low_count > 0:
-            await self._sync_heap(session, queue)
-
         summary = {
             "medium_jobs_aged": medium_count,
             "low_jobs_aged": low_count,
             "total_aged": medium_count + low_count,
             "timestamp": now.isoformat(),
         }
-        logger.info("aging_complete", **summary)
+        if medium_count or low_count:
+            logger.info("aging_complete", **summary)
         return summary
 
-    async def _age(self, priority: int, cutoff: datetime, session: AsyncSession) -> int:
-        """
-        Decrement effective_priority for pending jobs of a given priority
-        that have been waiting since before the cutoff.
-        Returns number of rows updated.
-        """
+    async def _age(
+        self,
+        priority: int,
+        cutoff: datetime,
+        session: AsyncSession,
+    ) -> int:
         result = await session.execute(
             update(Job)
             .where(
                 Job.status == JobStatus.PENDING,
                 Job.priority == priority,
                 Job.effective_priority > _PRIORITY_FLOOR,
-                Job.created_at <= cutoff,
+                Job.available_at <= cutoff,
                 Job.deleted_at.is_(None),
                 Job.is_dlq.is_(False),
             )
@@ -69,39 +67,4 @@ class AgingProcess:
             )
             .returning(Job.id)
         )
-        updated = result.fetchall()
-        count = len(updated)
-        if count > 0:
-            logger.info("jobs_aged", priority=priority, count=count)
-        return count
-
-    async def _sync_heap(self, session: AsyncSession, queue: HeapQueue) -> None:
-        """
-        After aging, reload all pending jobs whose effective_priority
-        has dropped below their raw priority and update them in the heap.
-        """
-        result = await session.execute(
-            select(Job).where(
-                Job.status == JobStatus.PENDING,
-                Job.deleted_at.is_(None),
-                Job.is_dlq.is_(False),
-                Job.effective_priority < cast(Job.priority, Float),
-            )
-        )
-        aged_jobs = result.scalars().all()
-
-        for job in aged_jobs:
-            try:
-                if await queue.contains(str(job.id)):
-                    await queue.update_priority(
-                        job_id=str(job.id),
-                        new_priority=job.effective_priority,
-                        scheduled_at=job.scheduled_at.timestamp(),
-                        created_at=job.created_at.timestamp(),
-                    )
-            except Exception as exc:
-                logger.error(
-                    "aging_sync_error",
-                    job_id=str(job.id),
-                    error=str(exc),
-                )
+        return len(result.fetchall())
