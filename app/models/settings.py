@@ -11,7 +11,6 @@ class SettingKey:
 
     DLQ_THRESHOLD = "dlq_threshold"
     ALERT_EMAILS = "alert_emails"
-    SCHEDULER_STRATEGY = "scheduler_strategy"
 
 
 class Setting(BaseModel):

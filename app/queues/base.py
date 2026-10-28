@@ -2,56 +2,51 @@ from abc import ABC, abstractmethod
 
 
 class BaseQueue(ABC):
+    """Local, process-owned ready buffer.
+
+    This is *not* the durable queue. PostgreSQL is the source of truth for job
+    state; ``BaseQueue`` only orders jobs that one worker process has already
+    observed as eligible.
+    """
+
     @abstractmethod
     async def push(
         self,
         job_id: str,
         effective_priority: float,
-        scheduled_at: float,
+        available_at: float,
         created_at: float,
-    ) -> None:
-        """
-        Add a job to the queue.
-        """
+    ) -> bool:
+        """Add or replace a job. Returns False when the buffer is full."""
         ...
 
     @abstractmethod
-    async def pop(self) -> str | None:
-        """
-        Remove and return the most urgent job_id from the queue.
-        Returns None if the queue is empty.
-        """
+    async def pop(self, now: float | None = None) -> str | None:
+        """Return the most urgent job that is due, or None."""
         ...
 
     @abstractmethod
     async def remove(self, job_id: str) -> None:
-        """
-        Remove a specific job from the queue without processing it.
-        Used when a job is cancelled while still pending in the queue.
-        No-op if the job is not in the queue.
-        """
+        """Remove a job if present. No-op otherwise."""
         ...
 
     @abstractmethod
     async def size(self) -> int:
-        """
-        Return the number of valid (non-removed) jobs in the queue.
-        """
+        """Return the number of valid jobs in the buffer."""
+        ...
+
+    @abstractmethod
+    async def contains(self, job_id: str) -> bool:
+        """Return whether a job is currently buffered."""
         ...
 
     async def update_priority(
         self,
         job_id: str,
         new_priority: float,
-        scheduled_at: float,
+        available_at: float,
         created_at: float,
-    ) -> None:
-        """
-        Re-score a job with a new effective_priority.
-        Called by the aging process when it decrements a job's priority.
-
-        Default implementation: remove then re-push.
-        HeapQueue overrides this with lazy deletion for efficiency.
-        """
+    ) -> bool:
+        """Re-score a job, dropping and re-inserting it."""
         await self.remove(job_id)
-        await self.push(job_id, new_priority, scheduled_at, created_at)
+        return await self.push(job_id, new_priority, available_at, created_at)

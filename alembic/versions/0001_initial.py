@@ -311,7 +311,6 @@ def downgrade() -> None:
     op.drop_index("idx_settings_key", table_name="settings")
     op.drop_table("settings")
 
-    op.drop_index("idx_jobs_priority", table_name="jobs")
     op.drop_index("idx_jobs_worker_id", table_name="jobs")
     op.drop_index("idx_jobs_type", table_name="jobs")
     op.drop_index("idx_jobs_deleted_at", table_name="jobs")
