@@ -1,61 +1,51 @@
-"""
-Payload shape:
-    {
-        "lines": [
-            "2026-06-09T10:00:00Z INFO  Request received",
-            "2026-06-09T10:00:01Z ERROR Database timeout",
-            "2026-06-09T10:00:02Z ERROR Database timeout"
-        ],
-        "source": "app-server-01"   # optional label
-    }
-
-Result shape (on success):
-    {
-        "source": "app-server-01",
-        "total_lines": 3,
-        "parsed_lines": 3,
-        "parse_errors": 0,
-        "level_counts": {"INFO": 1, "ERROR": 2},
-        "top_errors": [
-            {"message": "Database timeout", "count": 2}
-        ],
-        "has_critical": false,
-        "error_rate_pct": 66.67
-    }
-"""
-
 from collections import Counter
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.logger import get_logger
 from app.handlers.base import BaseHandler
-from app.handlers.utils import parse_payload
+from app.handlers.registry import register_handler
 
 logger = get_logger(__name__)
 
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 TOP_ERRORS_LIMIT = 5
+MAX_LINES = 10_000
+MAX_LINE_LENGTH = 8_000
 
 
 class LogPayload(BaseModel):
-    lines: list[str]
-    source: str = "unknown"
+    lines: list[str] = Field(
+        description="Log lines formatted as '<timestamp> <LEVEL> <message>'."
+    )
+    source: str = Field(default="unknown", description="Optional source label.")
 
     @field_validator("lines")
     @classmethod
-    def must_not_be_empty(cls, v):
-        if not v:
+    def validate_lines(cls, value: list[str]) -> list[str]:
+        if not value:
             raise ValueError("'lines' must be a non-empty list.")
-        return v
+        if len(value) > MAX_LINES:
+            raise ValueError(f"'lines' must contain at most {MAX_LINES} entries.")
+        if any(len(line) > MAX_LINE_LENGTH for line in value):
+            raise ValueError(
+                f"Each log line must be at most {MAX_LINE_LENGTH} characters."
+            )
+        return value
 
 
-class LogProcessorHandler(BaseHandler):
-    async def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
-        p = parse_payload(payload, LogPayload)
-        lines: list = p.lines
-        source: str = p.source
+@register_handler(
+    "log_processing",
+    description="Parse and aggregate a batch of application log lines.",
+    tags=("analysis", "logs"),
+)
+class LogProcessorHandler(BaseHandler[LogPayload]):
+    payload_model = LogPayload
+
+    async def execute(self, payload: LogPayload) -> dict[str, Any]:
+        lines: list[str] = payload.lines
+        source: str = payload.source
 
         parsed = []
         parse_errors = []
@@ -70,7 +60,6 @@ class LogProcessorHandler(BaseHandler):
                 parse_errors.append(line)
                 continue
 
-            # Parts: [timestamp, level] or [timestamp, level, message]
             timestamp = parts[0]
             level = parts[1].upper()
             message = parts[2] if len(parts) == 3 else ""
@@ -95,7 +84,6 @@ class LogProcessorHandler(BaseHandler):
                 f"{len(parse_errors)} line(s) could not be parsed."
             )
 
-        # Aggregate
         level_counts = Counter(entry["level"] for entry in parsed)
 
         error_messages = [
