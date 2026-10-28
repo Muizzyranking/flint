@@ -17,7 +17,7 @@ execute jobs with PostgreSQL-backed durability — leases, retries, DAG workflow
 cooperative cancellation, priority aging, dead letter queue and transactional
 recurring jobs.
 
-**Docs:** `https://flint.muizzyranking.me/docs` · **Architecture:** `https://flint.muizzyranking.me/docs/architecture`
+**Docs:** `[https://flint.muizzyranking.me/docs](https://flint.muizzyranking.me/docs)` · **Architecture:** `[https://flint.muizzyranking.me/docs/architecture](https://flint.muizzyranking.me/docs/architecture)`
 
 ---
 
