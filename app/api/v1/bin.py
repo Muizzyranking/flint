@@ -2,10 +2,9 @@ from uuid import UUID
 
 from fastapi import APIRouter
 
-from app.core.exceptions import FlintException
 from app.dependencies import DBSession, PaginationParams
 from app.schemas.job import JobResponse
-from app.schemas.response import ApiResponse, Meta, error_response
+from app.schemas.response import ApiResponse, Meta
 from app.services import job
 
 router = APIRouter()
@@ -33,18 +32,11 @@ async def list_bin(db: DBSession, page_params: PaginationParams):
     response_model=ApiResponse[JobResponse],
 )
 async def restore_job(job_id: UUID, db: DBSession):
-    try:
-        job_result = await job.restore_job(job_id, db)
-        return ApiResponse[JobResponse](
-            message="Job restored successfully.",
-            data=JobResponse.model_validate(job_result),
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    job_result = await job.restore_job(job_id, db)
+    return ApiResponse[JobResponse](
+        message="Job restored successfully.",
+        data=JobResponse.model_validate(job_result),
+    )
 
 
 @router.delete(
@@ -54,12 +46,5 @@ async def restore_job(job_id: UUID, db: DBSession):
     response_model=ApiResponse[None],
 )
 async def hard_delete_job(job_id: UUID, db: DBSession):
-    try:
-        await job.hard_delete_job(job_id, db)
-        return ApiResponse[None](message="Job permanently deleted.")
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    await job.hard_delete_job(job_id, db)
+    return ApiResponse[None](message="Job permanently deleted.")

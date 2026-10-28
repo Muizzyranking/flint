@@ -3,10 +3,10 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models.enum import JobType
-from app.models.job import JobPriority, JobStatus
+from app.core.config import settings
+from app.models.enum import JobPriority, JobStatus
 
 INTERVAL_MULTIPLIERS: dict[str, int] = {
     "s": 1,
@@ -47,9 +47,7 @@ def parse_interval(interval_str: str) -> int:
 
 
 def format_interval_seconds(seconds: int) -> str:
-    """
-    Convert interval_seconds back to a human-readable string.
-    """
+    """Convert interval_seconds back to a human-readable string."""
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600:
@@ -64,7 +62,11 @@ def format_interval_seconds(seconds: int) -> str:
 
 
 class JobCreate(BaseModel):
-    type: JobType
+    type: str = Field(
+        min_length=1,
+        max_length=100,
+        description="Registered handler name, e.g. 'send_email'.",
+    )
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: JobPriority = JobPriority.MEDIUM
     scheduled_at: datetime | None = Field(
@@ -81,10 +83,30 @@ class JobCreate(BaseModel):
     )
     max_retries: int = Field(
         default=3,
-        ge=1,
+        ge=0,
         le=10,
         description="Maximum retry attempts before the job moves to DLQ.",
     )
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Job type must not be empty.")
+        return value
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        import json
+
+        encoded = json.dumps(value, separators=(",", ":"), default=str)
+        if len(encoded.encode("utf-8")) > settings.MAX_PAYLOAD_BYTES:
+            raise ValueError(
+                f"Payload exceeds the {settings.MAX_PAYLOAD_BYTES} byte limit."
+            )
+        return value
 
     @field_validator("interval")
     @classmethod
@@ -99,6 +121,23 @@ class JobCreate(BaseModel):
         if v is not None and len(v) != len(set(v)):
             raise ValueError("dependency_ids must not contain duplicates.")
         return v
+
+    @model_validator(mode="after")
+    def validate_handler_payload(self) -> "JobCreate":
+        from app.handlers import (
+            is_registered,
+            registered_handler_names,
+            validate_payload,
+        )
+
+        if not is_registered(self.type):
+            available = ", ".join(registered_handler_names()) or "none"
+            raise ValueError(
+                f"Unknown job type '{self.type}'. Types available in this "
+                f"deployment: {available}."
+            )
+        validate_payload(self.type, self.payload)
+        return self
 
     model_config = {
         "json_schema_extra": {
@@ -141,6 +180,7 @@ class JobResponse(BaseModel):
     priority: int
     status: str
     scheduled_at: datetime
+    available_at: datetime
     interval_seconds: int | None
     retry_count: int
     max_retries: int
@@ -150,6 +190,9 @@ class JobResponse(BaseModel):
     worker_id: str | None
     started_at: datetime | None
     completed_at: datetime | None
+    lease_expires_at: datetime | None
+    recurrence_id: UUID | None
+    recurrence_run: int
     is_dlq: bool
     created_at: datetime
 
@@ -160,15 +203,11 @@ class JobResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class JobListResponse(BaseModel):
-    jobs: list[JobResponse]
-
-
 class JobFilterParams(BaseModel):
     page: int = Field(default=1, ge=1, description="Page number (1-indexed).")
     limit: int = Field(default=20, ge=1, le=100, description="Items per page.")
     status: JobStatus | None = Field(default=None, description="Filter by status.")
-    type: JobType | None = Field(default=None, description="Filter by job type.")
+    type: str | None = Field(default=None, description="Filter by job type.")
     priority: JobPriority | None = Field(
         default=None, description="Filter by priority."
     )

@@ -7,7 +7,6 @@ from app.core.exceptions import JobNotInDLQException
 from app.core.logger import get_logger
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog, LogEvent
-from app.queues.heapq import HeapQueue
 from app.services.settings import get_dlq_threshold
 
 logger = get_logger(__name__)
@@ -17,28 +16,37 @@ async def send_to_dlq(
     job_id: uuid.UUID,
     error: str,
     session: AsyncSession,
-) -> None:
+    *,
+    expected_worker_id: str | None = None,
+) -> bool:
     """
     Move a job to the dead letter queue after exhausting all retries.
-
-    Steps:
-      1. Set status='failed', is_dlq=True, last_error, worker_id=None
-      2. Write job_failed log entry
-      3. Cascade-cancel downstream DAG dependents
-      4. Check DLQ count vs threshold — alert if breached
-      5. Publish SSE event (handled by caller via redis publish)
     """
-    await session.execute(
+    conditions = [Job.id == job_id]
+    if expected_worker_id is not None:
+        conditions.extend(
+            [
+                Job.status == JobStatus.PROCESSING,
+                Job.worker_id == expected_worker_id,
+                Job.cancellation_requested.is_(False),
+            ]
+        )
+
+    moved = await session.execute(
         update(Job)
-        .where(Job.id == job_id)
+        .where(*conditions)
         .values(
             status=JobStatus.FAILED,
             is_dlq=True,
             last_error=error,
             worker_id=None,
+            lease_expires_at=None,
             updated_at=func.now(),
         )
+        .returning(Job.id)
     )
+    if moved.scalar_one_or_none() is None:
+        return False
 
     log_entry = JobLog(
         job_id=job_id,
@@ -62,6 +70,7 @@ async def send_to_dlq(
     await dag.on_job_failed(job_id, session)
 
     await _check_and_alert(session)
+    return True
 
 
 async def _check_and_alert(session: AsyncSession) -> None:
@@ -162,7 +171,6 @@ async def get_recent_dlq_jobs(
 async def retry_dlq_job(
     job_id: uuid.UUID,
     session: AsyncSession,
-    queue: HeapQueue,
 ) -> Job:
     """
     Manually retry a job from the DLQ.
@@ -170,9 +178,10 @@ async def retry_dlq_job(
     Steps:
       1. Verify job exists and is in DLQ
       2. Reset: status='pending', is_dlq=False, retry_count=0,
-                last_error=None, worker_id=None
+                last_error=None, worker_id=None, available_at=now
       3. Call dag_service.on_dag_root_retried — reset downstream cancelled jobs
-      4. Re-evaluate dependencies: if all met, push to queue
+      4. Let the workers' pollers observe the pending row (dependency checks
+         happen in the claim query)
       5. Log and return updated job
     """
     result = await session.execute(
@@ -197,6 +206,12 @@ async def retry_dlq_job(
             last_error=None,
             worker_id=None,
             effective_priority=float(job.priority),
+            available_at=func.now(),
+            next_retry_at=None,
+            lease_expires_at=None,
+            started_at=None,
+            completed_at=None,
+            cancellation_requested=False,
             updated_at=func.now(),
         )
     )
@@ -216,19 +231,10 @@ async def retry_dlq_job(
 
     await dag_service.on_dag_root_retried(job_id, session)
 
-    has_unmet = await dag_service.has_unmet_dependencies(job_id, session)
-    if not has_unmet:
-        await queue.push(
-            job_id=str(job_id),
-            effective_priority=float(job.priority),
-            scheduled_at=job.scheduled_at.timestamp(),
-            created_at=job.created_at.timestamp(),
-        )
-
     await session.commit()
 
-    refreshed = await session.get(Job, job_id)
-    return refreshed  # type: ignore
+    await session.refresh(job)
+    return job
 
 
 async def remove_from_dlq(

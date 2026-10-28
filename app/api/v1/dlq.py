@@ -2,16 +2,12 @@ from uuid import UUID
 
 from fastapi import APIRouter
 
-from app.core.exceptions import FlintException
 from app.dependencies import DBSession, PaginationParams
-from app.queues.heapq import HeapQueue
 from app.schemas.job import JobResponse
-from app.schemas.response import ApiResponse, Meta, error_response
+from app.schemas.response import ApiResponse, Meta
 from app.services import dlq as dlq_service
 
 router = APIRouter()
-
-_queue = HeapQueue()
 
 
 @router.get("", summary="List DLQ jobs", response_model=ApiResponse[list[JobResponse]])
@@ -34,18 +30,11 @@ async def list_dlq(
     summary="Retry a DLQ job",
 )
 async def retry_dlq_job(job_id: UUID, db: DBSession):
-    try:
-        job = await dlq_service.retry_dlq_job(job_id, db, _queue)
-        return ApiResponse[JobResponse](
-            message="Job re-queued from DLQ successfully.",
-            data=JobResponse.model_validate(job),
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    job = await dlq_service.retry_dlq_job(job_id, db)
+    return ApiResponse[JobResponse](
+        message="Job re-queued from DLQ successfully.",
+        data=JobResponse.model_validate(job),
+    )
 
 
 @router.delete(
@@ -57,12 +46,5 @@ async def remove_from_dlq(
     job_id: UUID,
     db: DBSession,
 ):
-    try:
-        await dlq_service.remove_from_dlq(job_id, db)
-        return ApiResponse[None](message="Job removed from DLQ and moved to bin.")
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    await dlq_service.remove_from_dlq(job_id, db)
+    return ApiResponse[None](message="Job removed from DLQ and moved to bin.")

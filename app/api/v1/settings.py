@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from app.core.exceptions import FlintException
 from app.dependencies import DBSession
-from app.schemas.response import ApiResponse, error_response
+from app.schemas.response import ApiResponse
 from app.schemas.settings import SettingsUpdate
 from app.services import settings
 
@@ -28,24 +28,16 @@ async def get_settings(db: DBSession):
     response_model=ApiResponse[dict],
 )
 async def update_settings(body: SettingsUpdate, db: DBSession):
-    try:
-        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
 
-        if not updates:
-            return error_response(
-                message="No settings provided to update.",
-                errors=[{"message": "Request body must include at least one setting."}],
-                status_code=422,
-            )
+    if not updates:
+        raise FlintException(
+            "Request body must include at least one setting.",
+            status_code=422,
+        )
 
-        updated = await settings.update_settings(updates, db)
-        return ApiResponse[dict](
-            message="Settings updated successfully.",
-            data=updated,
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    updated = await settings.update_settings(updates, db)
+    return ApiResponse[dict](
+        message="Settings updated successfully.",
+        data=updated,
+    )

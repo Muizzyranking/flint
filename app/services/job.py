@@ -1,12 +1,9 @@
-import json
 import uuid
 from datetime import UTC, datetime
 
-import redis.asyncio as aioredis
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import String, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import (
     JobNotCancellableException,
     JobNotDeletableException,
@@ -14,6 +11,8 @@ from app.core.exceptions import (
     JobNotInBinException,
 )
 from app.core.logger import get_logger
+from app.db.redis import publish_event
+from app.handlers import validate_payload
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog, LogEvent
 from app.schemas.job import JobCreate, JobFilterParams, parse_interval
@@ -21,31 +20,18 @@ from app.services import dag as dag_service
 
 logger = get_logger(__name__)
 
-EVENTS_CHANNEL = "flint:events"
-
-
-async def _publish_sse_event(event: dict) -> None:
-    """Publish a job status change to the SSE Redis channel."""
-    try:
-        redis = aioredis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True,
-            encoding="utf-8",
-        )
-        await redis.publish(EVENTS_CHANNEL, json.dumps(event))
-        await redis.aclose()
-    except Exception as exc:
-        logger.error("sse_publish_error", error=str(exc))
-
 
 async def create_job(data: JobCreate, session: AsyncSession) -> Job:
     """
     Create a new job and write it to PostgreSQL.
 
-    The scheduler (worker/main.py) will pick it up on its next poll
-    and push it into the HeapQueue when scheduled_at becomes due
-    and all dependencies are met.
+    A worker's poller will observe it once ``available_at`` is due and all
+    dependencies are complete. The row itself is the durable queued job.
     """
+    # Defense in depth for callers that construct JobCreate programmatically
+    # (CLI/tests): never insert a job whose payload violates its handler schema.
+    validate_payload(data.type, data.payload)
+
     interval_seconds = None
     if data.interval:
         interval_seconds = parse_interval(data.interval)
@@ -58,6 +44,7 @@ async def create_job(data: JobCreate, session: AsyncSession) -> Job:
         await dag_service.check_cycle(temp_id, dependency_ids, session)
 
     scheduled_at = data.scheduled_at or datetime.now(UTC)
+    recurrence_id = uuid.uuid4() if interval_seconds else None
 
     job = Job(
         type=data.type,
@@ -66,9 +53,12 @@ async def create_job(data: JobCreate, session: AsyncSession) -> Job:
         effective_priority=float(data.priority),
         status=JobStatus.PENDING,
         scheduled_at=scheduled_at,
+        available_at=scheduled_at,
         interval_seconds=interval_seconds,
         max_retries=data.max_retries,
         retry_count=0,
+        recurrence_id=recurrence_id,
+        recurrence_run=1 if recurrence_id else 0,
     )
     session.add(job)
     await session.flush()
@@ -103,16 +93,13 @@ async def create_job(data: JobCreate, session: AsyncSession) -> Job:
     )
 
     # Notify SSE clients
-    await _publish_sse_event(
+    await publish_event(
         {
             "job_id": str(job.id),
             "status": JobStatus.PENDING,
             "type": job.type,
         }
     )
-
-    # Note: the scheduler will push this job into the HeapQueue
-    # on its next poll cycle when scheduled_at <= NOW and deps are met.
 
     return job
 
@@ -141,7 +128,7 @@ async def get_jobs(
         conditions.append(
             or_(
                 Job.type.ilike(term),
-                Job.id.cast(type_=__import__("sqlalchemy").String).ilike(term),
+                Job.id.cast(String).ilike(term),
             )
         )
 
@@ -206,16 +193,23 @@ async def cancel_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
         raise JobNotCancellableException(str(job_id), job.status)
 
     if job.status == JobStatus.PENDING:
-        await session.execute(
+        # Conditional on pending so a worker that claimed the job concurrently
+        # wins the race instead of us overwriting an active execution.
+        result = await session.execute(
             update(Job)
-            .where(Job.id == job_id)
+            .where(Job.id == job_id, Job.status == JobStatus.PENDING)
             .values(
                 status=JobStatus.CANCELLED,
                 cancellation_requested=True,
+                lease_expires_at=None,
+                worker_id=None,
                 updated_at=func.now(),
             )
         )
-        await dag_service.on_job_failed(job_id, session)
+        if result.rowcount == 0:  # type: ignore
+            await session.refresh(job)
+            raise JobNotCancellableException(str(job_id), job.status)
+        await dag_service.on_job_cancelled(job_id, session)
 
         session.add(
             JobLog(
@@ -228,11 +222,14 @@ async def cancel_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
         logger.info("job_cancelled", job_id=str(job_id), was_status="pending")
 
     elif job.status == JobStatus.PROCESSING:
-        await session.execute(
+        result = await session.execute(
             update(Job)
-            .where(Job.id == job_id)
+            .where(Job.id == job_id, Job.status == JobStatus.PROCESSING)
             .values(cancellation_requested=True, updated_at=func.now())
         )
+        if result.rowcount == 0:  # type: ignore
+            await session.refresh(job)
+            raise JobNotCancellableException(str(job_id), job.status)
         session.add(
             JobLog(
                 job_id=job_id,
@@ -251,9 +248,8 @@ async def cancel_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
         )
 
     await session.commit()
-    await _publish_sse_event({"job_id": str(job_id), "status": JobStatus.CANCELLED})
-    job = await session.get(Job, job_id)
-    assert job is not None, f"Job {job_id} vanished after cancellation"
+    await publish_event({"job_id": str(job_id), "status": JobStatus.CANCELLED})
+    await session.refresh(job)
     return job
 
 
@@ -311,8 +307,7 @@ async def restore_job(job_id: uuid.UUID, session: AsyncSession) -> Job:
     )
     await session.commit()
     logger.info("job_restored", job_id=str(job_id))
-    job = await session.get(Job, job_id)
-    assert job is not None, f"Job {job_id} vanished after cancellation"
+    await session.refresh(job)
     return job
 
 

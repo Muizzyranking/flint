@@ -1,56 +1,54 @@
 import asyncio
 
-import redis.asyncio as aioredis
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.security import verify_sse_api_key
+from app.db.redis import EVENTS_CHANNEL, get_redis
 
 logger = get_logger(__name__)
 
 router = APIRouter()
-
-EVENTS_CHANNEL = "flint:events"
+KEEPALIVE_SECONDS = 15.0
 
 
 async def _event_generator(request: Request):
-    """
-    Async generator that yields SSE-formatted strings.
-    """
-    redis_client = aioredis.from_url(
-        settings.REDIS_URL,
-        decode_responses=True,
-        socket_timeout=None,
-        socket_connect_timeout=5,
-    )
-    pubsub = redis_client.pubsub()
+    redis_client = await get_redis()
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(EVENTS_CHANNEL)
 
-    logger.info("sse_client_connected", path=str(request.url))
-
+    logger.info("sse_client_connected", path=str(request.url.path))
     try:
-        async for message in pubsub.listen():
+        while True:
             if await request.is_disconnected():
                 break
 
-            if message["type"] != "message":
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True,
+                timeout=KEEPALIVE_SECONDS,
+            )
+            if message is None:
+                # Comment frame keeps proxies and browsers from closing idle
+                # connections while also giving us a chance to notice
+                # disconnects.
+                yield ": keepalive\n\n"
                 continue
 
             data = message.get("data", "")
             if isinstance(data, bytes):
                 data = data.decode("utf-8")
-
             yield f"data: {data}\n\n"
-
     except asyncio.CancelledError:
         pass
     except Exception as exc:
         logger.error("sse_stream_error", error=str(exc))
     finally:
-        await pubsub.unsubscribe(EVENTS_CHANNEL)
-        await pubsub.aclose()
+        try:
+            await pubsub.unsubscribe(EVENTS_CHANNEL)
+            await pubsub.aclose()
+        except Exception:
+            pass
         logger.info("sse_client_disconnected")
 
 
@@ -58,12 +56,12 @@ async def _event_generator(request: Request):
     "/stream",
     summary="Live job event stream",
     description=(
-        "Server-Sent Events stream. Connect with EventSource to receive "
-        "real-time job status updates. No API key required (EventSource "
-        "cannot set custom headers)."
+        "Server-Sent Events stream of job status changes. EventSource cannot "
+        "set custom headers, so pass `?api_key=...` when using it from the "
+        "browser."
     ),
     response_class=StreamingResponse,
-    tags=["SSE"],
+    dependencies=[Depends(verify_sse_api_key)],
 )
 async def sse_stream(request: Request):
     return StreamingResponse(
@@ -73,6 +71,5 @@ async def sse_stream(request: Request):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
         },
     )

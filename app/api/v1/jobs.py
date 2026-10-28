@@ -3,7 +3,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from app.core.exceptions import FlintException
 from app.dependencies import DBSession
 from app.schemas.job import (
     JobCreate,
@@ -11,7 +10,7 @@ from app.schemas.job import (
     JobLogResponse,
     JobResponse,
 )
-from app.schemas.response import ApiResponse, Meta, error_response
+from app.schemas.response import ApiResponse, Meta
 from app.services import job as job_service
 
 router = APIRouter()
@@ -27,24 +26,11 @@ async def create_job(
     body: JobCreate,
     db: DBSession,
 ):
-    try:
-        job = await job_service.create_job(body, db)
-        return ApiResponse[JobResponse](
-            message="Job created successfully.",
-            data=JobResponse.model_validate(job),
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
-    except ValueError as exc:
-        return error_response(
-            message="Validation error.",
-            errors=[{"message": str(exc)}],
-            status_code=422,
-        )
+    job = await job_service.create_job(body, db)
+    return ApiResponse[JobResponse](
+        message="Job created successfully.",
+        data=JobResponse.model_validate(job),
+    )
 
 
 @router.get(
@@ -77,21 +63,14 @@ async def get_job(
     job_id: UUID,
     db: DBSession,
 ):
-    try:
-        job, dependency_ids, logs = await job_service.get_job_with_details(job_id, db)
-        data = JobResponse.model_validate(job)
-        data.dependencies = dependency_ids
-        data.logs = [JobLogResponse.model_validate(log) for log in logs]
-        return ApiResponse[JobResponse](
-            message="Job retrieved successfully.",
-            data=data,
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    job, dependency_ids, logs = await job_service.get_job_with_details(job_id, db)
+    data = JobResponse.model_validate(job)
+    data.dependencies = dependency_ids
+    data.logs = [JobLogResponse.model_validate(log) for log in logs]
+    return ApiResponse[JobResponse](
+        message="Job retrieved successfully.",
+        data=data,
+    )
 
 
 @router.patch(
@@ -103,18 +82,11 @@ async def cancel_job(
     job_id: UUID,
     db: DBSession,
 ):
-    try:
-        job = await job_service.cancel_job(job_id, db)
-        return ApiResponse[JobResponse](
-            message="Cancellation requested successfully.",
-            data=JobResponse.model_validate(job),
-        )
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    job = await job_service.cancel_job(job_id, db)
+    return ApiResponse[JobResponse](
+        message="Cancellation requested successfully.",
+        data=JobResponse.model_validate(job),
+    )
 
 
 @router.delete(
@@ -123,12 +95,5 @@ async def cancel_job(
     response_model=ApiResponse[None],
 )
 async def soft_delete_job(job_id: UUID, db: DBSession):
-    try:
-        await job_service.soft_delete_job(job_id, db)
-        return ApiResponse[None](message="Job moved to bin.")
-    except FlintException as exc:
-        return error_response(
-            message=exc.message,
-            errors=[{"message": exc.message}],
-            status_code=exc.status_code,
-        )
+    await job_service.soft_delete_job(job_id, db)
+    return ApiResponse[None](message="Job moved to bin.")

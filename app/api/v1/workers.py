@@ -1,4 +1,5 @@
-from typing import Annotated
+import json
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
@@ -9,7 +10,8 @@ from app.schemas.response import ApiResponse
 
 router = APIRouter()
 
-WORKER_KEY_PATTERN = "flint:workers:*"
+WORKER_KEY_PREFIX = "flint:workers:"
+WORKER_KEY_PATTERN = f"{WORKER_KEY_PREFIX}*"
 WORKER_CONTROL_CHANNEL = "flint:worker:control:{worker_id}"
 
 
@@ -19,22 +21,37 @@ WORKER_CONTROL_CHANNEL = "flint:worker:control:{worker_id}"
     response_model=ApiResponse[list[dict]],
 )
 async def list_workers(redis: Annotated[Redis, Depends(get_redis)]):
-    """
-    Returns all workers currently registered in Redis.
-    Workers that have died without deregistering will disappear
-    automatically once their TTL (60s) expires.
+    """Return workers currently registered in Redis.
+
+    Presence is best-effort and expires automatically if a worker dies.
+    Worker IDs include a host/pid/random suffix, so multiple containers can
+    share a Redis instance without colliding.
     """
     keys = await redis.keys(WORKER_KEY_PATTERN)
 
-    workers = []
+    workers: list[dict[str, Any]] = []
     for key in keys:
-        worker_id = key.replace("flint:workers:", "")  # type: ignore
-        status = await redis.get(key) or "unknown"
+        # redis-py is configured with decode_responses=True, but its typing
+        # allows bytes keys, so decode defensively before stripping.
+        key_text = key.decode() if isinstance(key, bytes) else str(key)
+        worker_id = key_text.removeprefix(WORKER_KEY_PREFIX)
+        raw = await redis.get(key)
         ttl = await redis.ttl(key)
+        status: Any = raw or "unknown"
+        capabilities: list[str] = []
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    status = parsed.get("status", "unknown")
+                    capabilities = list(parsed.get("capabilities", []))
+            except (json.JSONDecodeError, TypeError):
+                pass
         workers.append(
             {
                 "worker_id": worker_id,
                 "status": status,
+                "capabilities": capabilities,
                 "ttl_seconds": ttl,
             }
         )
@@ -67,7 +84,8 @@ async def stop_worker(worker_id: str, redis: Annotated[Redis, Depends(get_redis)
     summary="Signal a worker to restart",
     description=(
         "Publishes a 'restart' command to the worker's control channel. "
-        "The worker will re-exec itself after finishing its current job."
+        "The worker stops accepting work and exits so the orchestrator can "
+        "replace it."
     ),
 )
 async def restart_worker(worker_id: str, redis: Annotated[Redis, Depends(get_redis)]):
@@ -81,8 +99,6 @@ async def restart_worker(worker_id: str, redis: Annotated[Redis, Depends(get_red
 
 
 async def _assert_worker_exists(worker_id: str, redis: Redis) -> None:
-    """Raise WorkerNotFoundException if the worker is not in Redis."""
-    key = f"flint:workers:{worker_id}"
-    exists = await redis.exists(key)
-    if not exists:
+    key = f"{WORKER_KEY_PREFIX}{worker_id}"
+    if not await redis.exists(key):
         raise WorkerNotFoundException(worker_id)

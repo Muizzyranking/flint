@@ -53,18 +53,6 @@ class JobNotDeletableException(FlintException):
         )
 
 
-class JobAlreadyProcessingException(FlintException):
-    """
-    Raised when two workers attempt to claim the same job.
-    """
-
-    def __init__(self, job_id: str) -> None:
-        super().__init__(
-            message=f"Job '{job_id}' is already being processed by another worker.",
-            status_code=409,
-        )
-
-
 class JobNotInBinException(FlintException):
     """
     Raised when a restore or hard-delete is attempted on a non-deleted job.
@@ -121,26 +109,33 @@ class HandlerNotFoundException(FlintException):
     Raised when no handler is registered for a given job type.
     """
 
-    def __init__(self, job_type: str) -> None:
+    def __init__(self, job_type: str, supported: list[str] | None = None) -> None:
+        supported_text = ", ".join(supported) if supported else "none"
         super().__init__(
             message=(
                 f"No handler registered for job type '{job_type}'. "
-                "Supported types: send_email, webhook_delivery, log_processing."
+                f"Types available in this deployment: {supported_text}."
             ),
             status_code=422,
         )
 
 
-class InvalidIntervalException(FlintException):
-    """Raised when an interval string cannot be parsed."""
+class PayloadValidationException(FlintException, ValueError):
+    """Raised when a job payload does not match its handler's schema.
 
-    def __init__(self, interval: str) -> None:
+    It is also a ``ValueError`` so Pydantic model validators can raise it
+    directly; the global validation handler unwraps the structured ``errors``
+    instead of returning a single opaque field error.
+    """
+
+    def __init__(self, job_type: str, errors: list[dict]) -> None:
+        self.errors = errors
+        summary = "; ".join(
+            f"{error.get('field', '(root)')}: {error.get('message', 'invalid')}"
+            for error in errors[:5]
+        )
         super().__init__(
-            message=(
-                f"Invalid interval format: '{interval}'. "
-                "Use <number><unit> where unit is one of: s, m, h, d, mo, y. "
-                "Examples: '30s', '5m', '2h', '1d', '1mo', '1y'."
-            ),
+            message=f"Invalid payload for job type '{job_type}': {summary}",
             status_code=422,
         )
 

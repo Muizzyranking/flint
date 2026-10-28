@@ -97,15 +97,3 @@ async def get_alert_emails(db: AsyncSession) -> list[str]:
     except (ValueError, TypeError, json.JSONDecodeError):
         logger.warning("alert_emails_parse_error", raw_value=raw)
         return []
-
-
-async def get_scheduler_strategy(db: AsyncSession) -> str:
-    """
-    Return the active scheduler strategy: 'heap' or 'timing_wheel'.
-    Falls back to 'heap' if the setting is missing or invalid.
-    """
-    raw = await get_setting_with_default(SettingKey.SCHEDULER_STRATEGY, "heap", db)
-    if raw not in ("heap", "timing_wheel"):
-        logger.warning("scheduler_strategy_invalid", raw_value=raw)
-        return "heap"
-    return raw

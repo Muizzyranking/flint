@@ -17,16 +17,3 @@ class LogEntryResponse(BaseModel):
         "from_attributes": True,
         "populate_by_name": True,
     }
-
-
-class LogFilterParams(BaseModel):
-    page: int = Field(default=1, ge=1)
-    limit: int = Field(default=20, ge=1, le=100)
-    event: str | None = Field(
-        default=None,
-        description="Filter by event name e.g. 'job_completed'.",
-    )
-    job_id: UUID | None = Field(
-        default=None,
-        description="Filter logs for a specific job.",
-    )
