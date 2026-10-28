@@ -1,5 +1,4 @@
 import uuid
-from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,9 +8,6 @@ from app.core.logger import get_logger
 from app.models.job import Job, JobStatus
 from app.models.job_depedencies import JobDependency
 from app.models.job_log import JobLog, LogEvent
-
-if TYPE_CHECKING:
-    from app.queues.base import BaseQueue
 
 logger = get_logger(__name__)
 
@@ -107,75 +103,6 @@ async def create_dependencies(
     )
 
 
-async def on_job_completed(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-    queue: "BaseQueue",
-) -> None:
-    """
-    Called after every successful job completion.
-    """
-    result = await db.execute(
-        select(JobDependency.job_id).where(JobDependency.depends_on_id == job_id)
-    )
-    dependent_job_ids = [row[0] for row in result.fetchall()]
-
-    for dependent_id in dependent_job_ids:
-        await _maybe_unblock_job(dependent_id, db, queue)
-
-
-async def _maybe_unblock_job(
-    job_id: uuid.UUID,
-    db: AsyncSession,
-    queue: "BaseQueue",
-) -> None:
-    """
-    Check if all dependencies of job_id are completed.
-    If yes, push the job onto the queue.
-    """
-    result = await db.execute(
-        select(Job).where(
-            Job.id == job_id,
-            Job.deleted_at.is_(None),
-        )
-    )
-    job = result.scalar_one_or_none()
-    if not job or job.status != JobStatus.PENDING:
-        return
-
-    total_result = await db.execute(
-        select(func.count(JobDependency.id)).where(JobDependency.job_id == job_id)
-    )
-    total_deps = total_result.scalar() or 0
-
-    if total_deps == 0:
-        return
-
-    # Count completed dependencies
-    completed_result = await db.execute(
-        select(func.count(Job.id))
-        .join(JobDependency, Job.id == JobDependency.depends_on_id)
-        .where(
-            JobDependency.job_id == job_id,
-            Job.status == JobStatus.COMPLETED,
-        )
-    )
-    completed_count = completed_result.scalar() or 0
-
-    if completed_count == total_deps:
-        logger.info(
-            "job_unblocked",
-            job_id=str(job_id),
-            completed_deps=completed_count,
-        )
-        await queue.push(
-            job_id=str(job_id),
-            effective_priority=job.effective_priority,
-            scheduled_at=job.scheduled_at.timestamp(),
-            created_at=job.created_at.timestamp(),
-        )
-
-
 async def on_job_failed(
     job_id: uuid.UUID,
     db: AsyncSession,
@@ -183,19 +110,55 @@ async def on_job_failed(
     """
     Called when a job exhausts its retries and moves to the DLQ.
     """
-    await _cascade_cancel(job_id, db)
+    await _cascade(job_id, db, failed_permanently=True)
 
 
-async def _cascade_cancel(
-    failed_job_id: uuid.UUID,
+async def on_job_cancelled(
+    job_id: uuid.UUID,
     db: AsyncSession,
 ) -> None:
     """
-    BFS through the dependency graph cancelling all downstream jobs.
-    Only cancels jobs that are still 'pending'.
+    Called when a job resolves to 'cancelled' before it could complete —
+    whether the user cancelled a pending job or a worker resolved a
+    cooperative cancellation. A cancelled job will never complete, so its
+    pending dependents can never run either.
     """
-    queue: list[uuid.UUID] = [failed_job_id]
-    visited: set[uuid.UUID] = {failed_job_id}
+    await _cascade(job_id, db, failed_permanently=False)
+
+
+async def _cascade(
+    root_job_id: uuid.UUID,
+    db: AsyncSession,
+    *,
+    failed_permanently: bool,
+) -> None:
+    """
+    BFS through the dependency graph cancelling all downstream jobs.
+    Only cancels jobs that are still 'pending', and only walks *through*
+    subtrees it actually cancelled — a dependent that is still processing
+    keeps ownership of its own subtree and will cascade (or not) when it
+    itself resolves.
+    """
+    if failed_permanently:
+        error_note = (
+            f"Cancelled: dependency job {root_job_id} "
+            f"failed permanently and was moved to DLQ."
+        )
+        cascade_reason = "upstream_dependency_failed"
+        log_message = (
+            f"Job automatically cancelled because upstream dependency "
+            f"{root_job_id} failed permanently."
+        )
+    else:
+        error_note = f"Cancelled: dependency job {root_job_id} was cancelled."
+        cascade_reason = "upstream_dependency_cancelled"
+        log_message = (
+            f"Job automatically cancelled because upstream dependency "
+            f"{root_job_id} was cancelled."
+        )
+
+    queue: list[uuid.UUID] = [root_job_id]
+    visited: set[uuid.UUID] = {root_job_id}
 
     while queue:
         current_id = queue.pop(0)
@@ -222,10 +185,7 @@ async def _cascade_cancel(
                 )
                 .values(
                     status=JobStatus.CANCELLED,
-                    last_error=(
-                        f"Cancelled: dependency job {failed_job_id} "
-                        f"failed permanently and was moved to DLQ."
-                    ),
+                    last_error=error_note,
                     updated_at=func.now(),
                 )
                 .returning(Job.id)
@@ -236,13 +196,10 @@ async def _cascade_cancel(
                 log_entry = JobLog(
                     job_id=dep_id,
                     event=LogEvent.JOB_CANCELLED,
-                    message=(
-                        f"Job automatically cancelled because upstream "
-                        f"dependency {failed_job_id} failed permanently."
-                    ),
+                    message=log_message,
                     metadata_={
-                        "failed_dependency_id": str(failed_job_id),
-                        "reason": "upstream_dependency_failed",
+                        "failed_dependency_id": str(root_job_id),
+                        "reason": cascade_reason,
                     },
                 )
                 db.add(log_entry)
@@ -250,10 +207,13 @@ async def _cascade_cancel(
                 logger.info(
                     "job_cascade_cancelled",
                     job_id=str(dep_id),
-                    failed_dependency=str(failed_job_id),
+                    failed_dependency=str(root_job_id),
+                    reason=cascade_reason,
                 )
 
-            queue.append(dep_id)
+                # Only cascade further through nodes we actually cancelled;
+                # anything else resolves its own subtree.
+                queue.append(dep_id)
 
     await db.commit()
 
@@ -274,6 +234,8 @@ async def _cascade_reset(
 ) -> None:
     """
     BFS through the dependency graph resetting auto-cancelled downstream jobs.
+    Like the cancel cascade, it only walks *through* nodes it actually reset —
+    a user-cancelled branch keeps its subtree cancelled.
     """
     queue: list[uuid.UUID] = [retried_job_id]
     visited: set[uuid.UUID] = {retried_job_id}
@@ -344,7 +306,9 @@ async def _cascade_reset(
                     retried_dependency=str(retried_job_id),
                 )
 
-            queue.append(dep_id)
+                # Only continue the reset through nodes we actually reset;
+                # anything else resolved on its own and owns its subtree.
+                queue.append(dep_id)
 
     await session.commit()
 
