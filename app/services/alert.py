@@ -1,8 +1,5 @@
 import os
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-import aiosmtplib
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,7 +7,7 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "templates", "emails")
+TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "templates", "email")
 
 jinja_env = Environment(
     loader=FileSystemLoader(TEMPLATE_DIR),
@@ -26,6 +23,7 @@ async def send_dlq_alert(
     Send a DLQ threshold alert email to all configured recipients.
     """
     from app.core.config import settings as app_settings
+    from app.core.email import EmailMessage, send_email
     from app.services.dlq import get_recent_dlq_jobs
     from app.services.settings import get_alert_emails, get_dlq_threshold
 
@@ -47,7 +45,7 @@ async def send_dlq_alert(
             dlq_count=dlq_count,
             threshold=threshold,
             jobs=recent_jobs,
-            dashboard_url="https://app.flint.local/dlq",
+            dashboard_url=app_settings.FRONTEND_URL.rstrip("/") + "/dlq",
             app_name="Flint",
             tagline="Quietly igniting your payload, every job has a spark.",
         )
@@ -64,14 +62,23 @@ async def send_dlq_alert(
     )
 
     for recipient in recipients:
-        await _send_email(
-            to=recipient,
-            subject=subject,
-            html_body=html_body,
-            smtp_host=app_settings.SMTP_HOST,
-            smtp_port=app_settings.SMTP_PORT,
-            smtp_from=app_settings.SMTP_FROM,
-        )
+        try:
+            await send_email(
+                EmailMessage(
+                    to=recipient,
+                    subject=subject,
+                    body="Flint DLQ Alert: threshold reached. "
+                    "Visit your dashboard for details.",
+                    html=html_body,
+                )
+            )
+            logger.info("dlq_alert_email_delivered", to=recipient)
+        except Exception as exc:
+            logger.error(
+                "dlq_alert_email_failed",
+                to=recipient,
+                error=str(exc),
+            )
 
     logger.warning(
         "dlq_alert_sent",
@@ -79,42 +86,6 @@ async def send_dlq_alert(
         threshold=threshold,
         recipient_count=len(recipients),
     )
-
-
-async def _send_email(
-    to: str,
-    subject: str,
-    html_body: str,
-    smtp_host: str,
-    smtp_port: int,
-    smtp_from: str,
-) -> None:
-    """Send a single HTML email via aiosmtplib."""
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = smtp_from
-    msg["To"] = to
-
-    # Attach plain text fallback first, then HTML
-    plain = "Flint DLQ Alert: threshold reached. Visit your dashboard for details."
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    try:
-        await aiosmtplib.send(
-            msg,
-            hostname=smtp_host,
-            port=smtp_port,
-            use_tls=False,
-            start_tls=False,
-        )
-        logger.info("dlq_alert_email_delivered", to=to)
-    except Exception as exc:
-        logger.error(
-            "dlq_alert_email_failed",
-            to=to,
-            error=str(exc),
-        )
 
 
 def _plain_text_fallback(
