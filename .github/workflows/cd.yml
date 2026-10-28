@@ -21,11 +21,15 @@ jobs:
           port: ${{ secrets.EC2_PORT }}
           script: |
             cd /var/www/flint/backend
-            echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" > .env
-            echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}" >> .env
-            echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}" >> .env
+            {
+              echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}"
+              echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}"
+              echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}"
+              echo "APP_ENV=production"
+              if [ -n "${{ secrets.API_KEY }}" ]; then echo "API_KEY=${{ secrets.API_KEY }}"; fi
+            } > .env
             git pull origin main
-            docker-compose down
-            docker-compose up -d --build
+            docker compose down
+            docker compose up -d --build
             docker system prune -f
             sudo nginx -t && sudo systemctl reload nginx
