@@ -1,0 +1,23 @@
+# Build/runtime caches
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.pyright_cache
+
+# Local state and secrets
+.git
+.env
+logs
+*.log
+
+# Local-only files
+opencode
+tests
+
+# Build artefacts
+build
+dist
+*.egg-info

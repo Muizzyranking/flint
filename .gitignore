@@ -8,4 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+.env.*
+!.env.example
+
+# Local runtime state
+logs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright_cache/
+
 /docs/SPEC.md
